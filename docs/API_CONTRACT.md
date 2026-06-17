@@ -60,6 +60,7 @@ These tools are the supported surface for long-running Codex orchestration:
 - `codex_list_pending_interactions`
 - `codex_answer_pending_interaction`
 - `codex_interrupt_turn`
+- `codex_get_runtime_capabilities`
 - `codex_health_summary`
 - `codex_collect_diagnostics`
 - `codex_repair_issue`
@@ -72,13 +73,13 @@ fields must not be removed without changing `contractVersion`.
 
 Server-level default write policy is configured by environment/config:
 
-- `CODEX_MCP_DEFAULT_SANDBOX`, default `danger-full-access`
-- `CODEX_MCP_DEFAULT_APPROVAL_POLICY`, default `never`
+- `CODEX_MCP_DEFAULT_SANDBOX`, default `read-only`
+- `CODEX_MCP_DEFAULT_APPROVAL_POLICY`, default `on-request`
 - JSON config fields `default_sandbox_policy` and `default_approval_policy`
 
 Explicit tool arguments always win over server defaults. A client may submit one
-task with `sandbox="read-only"` or `approval_policy="on-request"` without
-changing the server configuration.
+task with a stricter or more permissive policy without changing the server
+configuration.
 
 ## Durable operation types
 
@@ -108,6 +109,103 @@ Status payloads for `steer_turn` include normal operation fields plus:
 
 If the target turn is missing, MCP returns `CODEX_TURN_NOT_FOUND`. If the target
 turn is terminal or belongs to another thread, MCP returns `INVALID_ARGUMENT`.
+
+## Turn progress journal
+
+`codex_get_turn_status` and `codex_get_operation_status` return compact progress
+data for tracked app-server turns by default.
+
+Inputs:
+
+- `progress_events`: number of recent progress events to return. Default `10`,
+  max `100`. Use `0` to omit the progress block.
+- `progress_max_chars`: max text returned for one progress event. Default
+  `2000`.
+
+Status payloads may include:
+
+- `progressEvents`
+- `progressEventCount`
+- `latestProgressAt`
+- `tokenUsage`
+- `modelReroutes`
+- `warnings`
+
+Supported progress sources:
+
+- `item/agentMessage/delta`
+- `item/plan/delta`
+- `item/reasoning/summaryPartAdded`
+- `item/reasoning/summaryTextDelta`
+- `thread/tokenUsage/updated`
+- `model/rerouted`
+- `warning`
+- `configWarning`
+- `guardianWarning`
+
+`turn/diff/updated` is stored as safe metadata only. MCP keeps diff size and
+line counts, but not the unified diff text. The progress journal also avoids raw
+tool payloads and command output by default. It records only app-server-visible
+progress summaries and does not expose hidden chain-of-thought.
+
+`codex_collect_diagnostics` includes the same data in `progressJournal` and adds
+progress entries to `timeline` with `source="turn_progress"`.
+
+## Runtime capabilities
+
+`codex_get_runtime_capabilities` is a read-only inventory endpoint for MCP
+clients that need to understand the local Codex runtime before starting work.
+It may start the MCP-owned app-server if it is not already running.
+
+Input fields:
+
+- `refresh`: default `false`. When `true`, bypasses the in-memory cache.
+- `cwd`: optional working directory used for permission profile, hooks, and
+  skills resolution. It must be inside `CODEX_ALLOWED_ROOTS`.
+- `timeout_seconds`: per-method timeout. Default `2`, max `30`.
+- `include_models`: default `true`.
+- `include_hooks`: default `true`.
+- `include_skills`: default `true`.
+
+The tool caches one snapshot for five minutes per `cwd` and include-flag set.
+Inventory calls are best effort. A timeout or error in one app-server method
+does not fail the whole tool. The response stays `ok=true` and reports the
+method state in `methodResults`.
+
+Top-level result fields:
+
+- `runtimeCapabilities`
+- `cacheState`
+- `methodResults`
+- `warnings`
+- `recommendedPollAfterSeconds=0`
+- `pollRecommended=false`
+
+`runtimeCapabilities` includes:
+
+- `status`: `ok`, `partial`, or `unavailable`.
+- `appServer`: process state plus redacted initialize metadata.
+- `schemaMethods`: compact static method manifest with source, version, hash,
+  method count, and method names.
+- `models`: `id`, `model`, `displayName`, `isDefault`, `hidden`,
+  `inputModalities`, reasoning effort fields, and service tier count.
+- `permissionProfiles`: `id` and `description`.
+- `sandboxReadiness`: Windows sandbox readiness status.
+- `hooks`: counts grouped by cwd, event, source, trust, enabled state, and
+  handler type. Raw hook commands and source paths are not returned.
+- `skills`: counts grouped by cwd, scope, and enabled state. Skill names may be
+  returned, but absolute paths are not returned.
+- `modelProviderCapabilities`: `webSearch`, `imageGeneration`, and
+  `namespaceTools`.
+
+The endpoint intentionally excludes account email, account usage, and rate
+limit data. Those fields need a separate privacy contract before they can be
+exposed.
+
+`codex_health_summary.runtimeCapabilities` contains only a compact subset from
+the last collected runtime snapshot: status, cache age, model count, default
+model, sandbox readiness, provider capabilities, and warning count. Health
+summary does not collect inventory on its own.
 
 ## Compatibility tools
 

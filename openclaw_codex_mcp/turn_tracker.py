@@ -18,7 +18,20 @@ ACTIVE_STATUSES = TURN_ACTIVE_STATUSES
 COMPLETION_OBSERVED_STATUSES = TURN_COMPLETION_OBSERVED_STATUSES
 TERMINAL_STATUSES = TURN_TERMINAL_STATUSES
 DEFAULT_HOOK_JOURNAL_TEXT_LIMIT = 20_000
+DEFAULT_PROGRESS_TEXT_LIMIT = 20_000
 WAITING_FOR_OPENCLAW_ERROR = "Waiting for OpenClaw response."
+PROGRESS_EVENT_METHODS = {
+    "item/agentMessage/delta",
+    "item/plan/delta",
+    "item/reasoning/summaryPartAdded",
+    "item/reasoning/summaryTextDelta",
+    "turn/diff/updated",
+    "thread/tokenUsage/updated",
+    "model/rerouted",
+    "warning",
+    "configWarning",
+    "guardianWarning",
+}
 _SECRET_PATTERNS = (
     re.compile(r"\bsk-[A-Za-z0-9_\-]{12,}\b"),
     re.compile(r"\bBearer\s+[A-Za-z0-9._\-]{12,}\b", re.IGNORECASE),
@@ -136,6 +149,7 @@ class TurnTracker:
             current = self.storage.get_tracked_turn(turn_id)
 
         self._record_plan_event(payload, thread_id=thread_id, turn_id=turn_id, received_at=received_at)
+        self._record_progress_event(payload, thread_id=thread_id, turn_id=turn_id, received_at=received_at)
 
         message = _assistant_message(payload, turn_id=turn_id, thread_id=thread_id, received_at=received_at)
         if message is not None:
@@ -282,7 +296,15 @@ class TurnTracker:
                 if not waiters:
                     self._first_message_waiters.pop(turn_id, None)
 
-    def get_turn_status(self, turn_id: str, *, last_messages: int, message_max_chars: int) -> dict[str, Any] | None:
+    def get_turn_status(
+        self,
+        turn_id: str,
+        *,
+        last_messages: int,
+        message_max_chars: int,
+        progress_events: int = 10,
+        progress_max_chars: int = 2000,
+    ) -> dict[str, Any] | None:
         turn = self.storage.get_tracked_turn(turn_id)
         if turn is None:
             return None
@@ -300,7 +322,7 @@ class TurnTracker:
         ]
         plans = [_plan_to_tool(row, message_max_chars) for row in self.storage.get_tracked_turn_plans(turn_id)]
         latest_plan = plans[-1] if plans else None
-        return {
+        result = {
             "ok": True,
             "thread_id": turn["thread_id"],
             "threadId": turn["thread_id"],
@@ -336,6 +358,8 @@ class TurnTracker:
             "appServerGeneration": turn.get("process_generation"),
             "stalenessSeconds": _staleness_seconds(turn.get("updated_at")),
         }
+        result.update(turn_progress_status_fields(self.storage, turn_id, progress_events=progress_events, progress_max_chars=progress_max_chars))
+        return result
 
     def running_turns(self) -> list[dict[str, Any]]:
         return self.storage.get_running_tracked_turns()
@@ -474,6 +498,12 @@ class TurnTracker:
                 "payload_json": json.dumps(payload, ensure_ascii=False),
             }
         )
+
+    def _record_progress_event(self, payload: dict[str, Any], *, thread_id: str, turn_id: str, received_at: str) -> None:
+        event = _progress_event(payload, thread_id=thread_id, turn_id=turn_id, received_at=received_at, max_chars=self.hook_history_max_text_chars)
+        if event is None:
+            return
+        self.storage.record_tracked_turn_progress_event(event)
 
     def _resolve_first_message(self, turn_id: str, message: dict[str, Any] | None) -> None:
         waiters = self._first_message_waiters.pop(turn_id, [])
@@ -746,6 +776,227 @@ def _event_error(payload: dict[str, Any]) -> str | None:
     return None
 
 
+def _progress_event(
+    payload: dict[str, Any],
+    *,
+    thread_id: str,
+    turn_id: str,
+    received_at: str,
+    max_chars: int,
+) -> dict[str, Any] | None:
+    method = str(payload.get("method") or "")
+    if method not in PROGRESS_EVENT_METHODS:
+        return None
+    params = _payload_params(payload)
+    category = method.replace("/", "_")
+    severity = "info"
+    item_id = _optional_str(params.get("itemId"))
+    sequence = _safe_int(params.get("sequence"), 0)
+    text: str | None = None
+    metadata: dict[str, Any] = {}
+
+    if method == "item/agentMessage/delta":
+        category = "agent_message_delta"
+        text, truncated = _clean_progress_text(params.get("delta"), max_chars)
+        metadata = {"itemId": item_id}
+    elif method == "item/plan/delta":
+        category = "plan_delta"
+        text, truncated = _clean_progress_text(params.get("delta"), max_chars)
+        metadata = {"itemId": item_id}
+    elif method == "item/reasoning/summaryPartAdded":
+        category = "reasoning_summary"
+        sequence = _safe_int(params.get("summaryIndex"), sequence)
+        text = "Reasoning summary part added."
+        truncated = False
+        metadata = {"itemId": item_id, "summaryIndex": params.get("summaryIndex")}
+    elif method == "item/reasoning/summaryTextDelta":
+        category = "reasoning_summary"
+        sequence = _safe_int(params.get("summaryIndex"), sequence)
+        text, truncated = _clean_progress_text(params.get("delta"), max_chars)
+        metadata = {"itemId": item_id, "summaryIndex": params.get("summaryIndex")}
+    elif method == "turn/diff/updated":
+        category = "diff_updated"
+        diff = params.get("diff") if isinstance(params.get("diff"), str) else ""
+        text = "Turn diff updated."
+        truncated = False
+        metadata = _diff_stats(diff)
+    elif method == "thread/tokenUsage/updated":
+        category = "token_usage"
+        text = "Token usage updated."
+        truncated = False
+        metadata = {"tokenUsage": _safe_metadata(params.get("tokenUsage"))}
+    elif method == "model/rerouted":
+        category = "model_reroute"
+        from_model = _optional_str(params.get("fromModel"))
+        to_model = _optional_str(params.get("toModel"))
+        reason = _optional_str(params.get("reason"))
+        text, truncated = _clean_progress_text(f"Model rerouted from {from_model or '?'} to {to_model or '?'}: {reason or 'unknown'}", max_chars)
+        metadata = {"fromModel": from_model, "toModel": to_model, "reason": reason}
+    elif method in {"warning", "guardianWarning"}:
+        category = "warning"
+        severity = "warning"
+        text, truncated = _clean_progress_text(params.get("message"), max_chars)
+        metadata = {"warningType": method}
+    elif method == "configWarning":
+        category = "warning"
+        severity = "warning"
+        summary = params.get("summary")
+        details = params.get("details")
+        joined = f"{summary or ''}\n{details or ''}".strip()
+        text, truncated = _clean_progress_text(joined, max_chars)
+        metadata = {
+            "warningType": method,
+            "path": _clean_metadata_string(params.get("path"), max_chars=1000),
+            "range": _safe_metadata(params.get("range")),
+        }
+    else:
+        return None
+
+    if not text and not metadata:
+        return None
+    return {
+        "event_hash": _progress_event_hash(payload, received_at),
+        "turn_id": turn_id,
+        "thread_id": thread_id,
+        "event_type": method,
+        "category": category,
+        "severity": severity,
+        "item_id": item_id,
+        "sequence": sequence,
+        "text": text,
+        "metadata_json": json.dumps(_safe_metadata(metadata), ensure_ascii=False, sort_keys=True),
+        "created_at": received_at,
+        "truncated": int(bool(truncated)),
+    }
+
+
+def turn_progress_status_fields(
+    storage: McpStorage,
+    turn_id: str,
+    *,
+    progress_events: int = 10,
+    progress_max_chars: int = 2000,
+) -> dict[str, Any]:
+    if progress_events <= 0:
+        return {}
+    rows = storage.list_tracked_turn_progress_events(turn_id=turn_id, limit=progress_events)
+    summary = storage.tracked_turn_progress_summary(turn_id)
+    token_event = summary.get("tokenUsageEvent")
+    token_metadata = _json_loads_dict((token_event or {}).get("metadata_json"))
+    return {
+        "progressEvents": [_progress_event_to_tool(row, progress_max_chars) for row in rows],
+        "progressEventCount": summary.get("eventCount", 0),
+        "latestProgressAt": summary.get("latestProgressAt"),
+        "tokenUsage": token_metadata.get("tokenUsage") if token_metadata else None,
+        "modelReroutes": [_model_reroute_to_tool(row, progress_max_chars) for row in summary.get("modelReroutes") or []],
+        "warnings": [_progress_event_to_tool(row, progress_max_chars) for row in summary.get("warnings") or []],
+    }
+
+
+def progress_event_to_tool(row: dict[str, Any], max_chars: int = 2000) -> dict[str, Any]:
+    return _progress_event_to_tool(row, max_chars)
+
+
+def _progress_event_to_tool(row: dict[str, Any], max_chars: int) -> dict[str, Any]:
+    text, budget = _truncate_with_budget(row.get("text"), max_chars)
+    metadata = _json_loads_dict(row.get("metadata_json"))
+    return {
+        "id": row.get("id"),
+        "eventHash": row.get("event_hash"),
+        "eventType": row.get("event_type"),
+        "category": row.get("category"),
+        "severity": row.get("severity"),
+        "threadId": row.get("thread_id"),
+        "turnId": row.get("turn_id"),
+        "itemId": row.get("item_id"),
+        "sequence": row.get("sequence"),
+        "createdAt": row.get("created_at"),
+        "text": text,
+        "metadata": metadata,
+        "truncated": bool(row.get("truncated")) or bool(budget["truncated"]),
+        "originalChars": budget["original_chars"],
+        "returnedChars": budget["returned_chars"],
+    }
+
+
+def _model_reroute_to_tool(row: dict[str, Any], max_chars: int) -> dict[str, Any]:
+    event = _progress_event_to_tool(row, max_chars)
+    metadata = event.get("metadata") if isinstance(event.get("metadata"), dict) else {}
+    return {
+        "createdAt": event.get("createdAt"),
+        "fromModel": metadata.get("fromModel"),
+        "toModel": metadata.get("toModel"),
+        "reason": metadata.get("reason"),
+        "event": event,
+    }
+
+
+def _progress_event_hash(payload: dict[str, Any], received_at: str) -> str:
+    return _stable_hash({"payload": payload, "received_at": received_at})
+
+
+def _clean_progress_text(value: Any, max_chars: int) -> tuple[str | None, bool]:
+    if value in (None, ""):
+        return None, False
+    raw = str(value)
+    cleaned = _journal_text(raw, max_chars)
+    return cleaned, len(raw) > max_chars
+
+
+def _clean_metadata_string(value: Any, *, max_chars: int) -> str | None:
+    text, _truncated = _clean_progress_text(value, max_chars)
+    return text
+
+
+def _safe_metadata(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(key): _safe_metadata(item) for key, item in value.items() if key not in {"diff", "payload", "toolCall", "toolOutput", "commandOutput"}}
+    if isinstance(value, list):
+        return [_safe_metadata(item) for item in value[:100]]
+    if isinstance(value, str):
+        return _clean_metadata_string(value, max_chars=2000)
+    if isinstance(value, int | float | bool) or value is None:
+        return value
+    return _clean_metadata_string(value, max_chars=2000)
+
+
+def _diff_stats(diff: str) -> dict[str, Any]:
+    lines = diff.splitlines()
+    return {
+        "charCount": len(diff),
+        "lineCount": len(lines),
+        "addedLineCount": sum(1 for line in lines if line.startswith("+") and not line.startswith("+++")),
+        "removedLineCount": sum(1 for line in lines if line.startswith("-") and not line.startswith("---")),
+        "fileMarkerCount": sum(1 for line in lines if line.startswith("diff --git ") or line.startswith("+++ ")),
+    }
+
+
+def _json_loads_dict(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if not value:
+        return {}
+    try:
+        loaded = json.loads(str(value))
+    except json.JSONDecodeError:
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def _safe_int(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _optional_str(value: Any) -> str | None:
+    if value in (None, ""):
+        return None
+    text = str(value).strip()
+    return text or None
+
+
 def _event_hash(payload: dict[str, Any]) -> str:
     data = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(data.encode("utf-8")).hexdigest()
@@ -787,6 +1038,19 @@ def _truncate(value: Any, max_chars: int) -> str | None:
     if len(text) <= max_chars:
         return text
     return text[: max(0, max_chars - 3)].rstrip() + "..."
+
+
+def _truncate_with_budget(value: Any, max_chars: int) -> tuple[str | None, dict[str, Any]]:
+    if value is None:
+        return None, {"truncated": False, "original_chars": 0, "returned_chars": 0}
+    text = str(value)
+    truncated = len(text) > max_chars
+    visible = _truncate(text, max_chars)
+    return visible, {
+        "truncated": truncated,
+        "original_chars": len(text),
+        "returned_chars": len(visible or ""),
+    }
 
 
 def _visible_last_error(turn: dict[str, Any]) -> str | None:

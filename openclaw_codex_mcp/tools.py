@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import json
 import os
@@ -46,6 +47,19 @@ from .models import Chat, TranscriptMessage, TranscriptSummary
 from .pending_interactions import PendingInteractionManager, interaction_row_to_tool
 from .prompt_dedup import DEFAULT_PROMPT_SIMILARITY_THRESHOLD, normalize_prompt, prompt_hash, prompt_similarity
 from .protocol import with_output_schema
+from .runtime_capabilities import (
+    RUNTIME_CAPABILITIES_CACHE_TTL_SECONDS,
+    compact_hooks,
+    compact_initialize_result,
+    compact_models,
+    compact_permission_profiles,
+    compact_provider_capabilities,
+    compact_sandbox_readiness,
+    compact_skills,
+    now_iso as runtime_now_iso,
+    runtime_health_subset,
+    schema_methods_block,
+)
 from .search import SearchIndex
 from .statuses import (
     OPERATION_ACTIVE_STATUSES,
@@ -55,7 +69,7 @@ from .statuses import (
 )
 from .storage import McpStorage
 from .transcripts import parse_transcript
-from .turn_tracker import WAITING_FOR_OPENCLAW_ERROR
+from .turn_tracker import WAITING_FOR_OPENCLAW_ERROR, progress_event_to_tool, turn_progress_status_fields
 
 
 UI_RELOAD_NOTE = "Desktop UI may not visually update until restart/reload for UI-started chats."
@@ -77,6 +91,7 @@ STABLE_OPENCLAW_TOOLS = {
     "codex_list_pending_interactions",
     "codex_answer_pending_interaction",
     "codex_interrupt_turn",
+    "codex_get_runtime_capabilities",
     "codex_health_summary",
     "codex_collect_diagnostics",
     "codex_repair_issue",
@@ -239,13 +254,13 @@ TOOLS: list[dict[str, Any]] = [
                 "approval_policy": {
                     "type": "string",
                     "enum": ["never", "on-request", "on-failure", "untrusted", "respect_existing", "never_auto_approve", "ask_openclaw"],
-                    "default": "never",
+                    "default": "on-request",
                 },
                 "collaboration_mode": {"type": ["string", "null"], "enum": ["default", "plan", None], "default": None},
                 "sandbox": {
                     "type": "string",
                     "enum": ["danger-full-access", "workspace-write", "read-only", "respect_existing"],
-                    "default": "danger-full-access",
+                    "default": "read-only",
                 },
             },
             "additionalProperties": False,
@@ -263,8 +278,8 @@ TOOLS: list[dict[str, Any]] = [
                 "title": {"type": ["string", "null"], "default": None},
                 "cwd": {"type": ["string", "null"], "default": None},
                 "model": {"type": ["string", "null"], "default": None},
-                "sandbox": {"type": ["string", "null"], "enum": ["read-only", "workspace-write", "danger-full-access", None], "default": "danger-full-access"},
-                "approval_policy": {"type": ["string", "null"], "enum": ["never", "on-request", "on-failure", "untrusted", "ask_openclaw", None], "default": "never"},
+                "sandbox": {"type": ["string", "null"], "enum": ["read-only", "workspace-write", "danger-full-access", None], "default": "read-only"},
+                "approval_policy": {"type": ["string", "null"], "enum": ["never", "on-request", "on-failure", "untrusted", "ask_openclaw", None], "default": "on-request"},
                 "collaboration_mode": {"type": ["string", "null"], "enum": ["default", "plan", None], "default": None},
                 "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 7200, "default": DEFAULT_TOOL_START_TIMEOUT_SECONDS},
                 "first_message_timeout_seconds": {
@@ -291,8 +306,8 @@ TOOLS: list[dict[str, Any]] = [
                 "title": {"type": ["string", "null"], "default": None},
                 "cwd": {"type": ["string", "null"], "default": None},
                 "model": {"type": ["string", "null"], "default": None},
-                "sandbox": {"type": ["string", "null"], "enum": ["read-only", "workspace-write", "danger-full-access", None], "default": "danger-full-access"},
-                "approval_policy": {"type": ["string", "null"], "enum": ["never", "on-request", "on-failure", "untrusted", "ask_openclaw", None], "default": "never"},
+                "sandbox": {"type": ["string", "null"], "enum": ["read-only", "workspace-write", "danger-full-access", None], "default": "read-only"},
+                "approval_policy": {"type": ["string", "null"], "enum": ["never", "on-request", "on-failure", "untrusted", "ask_openclaw", None], "default": "on-request"},
                 "client_request_id": {"type": ["string", "null"], "default": None},
                 "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 7200, "default": DEFAULT_TOOL_START_TIMEOUT_SECONDS},
                 "first_message_timeout_seconds": {
@@ -339,12 +354,12 @@ TOOLS: list[dict[str, Any]] = [
                 "approval_policy": {
                     "type": "string",
                     "enum": ["never", "on-request", "on-failure", "untrusted", "respect_existing", "never_auto_approve", "ask_openclaw"],
-                    "default": "never",
+                    "default": "on-request",
                 },
                 "sandbox": {
                     "type": "string",
                     "enum": ["danger-full-access", "workspace-write", "read-only", "respect_existing"],
-                    "default": "danger-full-access",
+                    "default": "read-only",
                 },
                 "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 7200, "default": DEFAULT_TOOL_START_TIMEOUT_SECONDS},
                 "first_message_max_chars": {"type": "integer", "minimum": 500, "maximum": 200000, "default": 8000},
@@ -363,6 +378,8 @@ TOOLS: list[dict[str, Any]] = [
                 "thread_id": {"type": ["string", "null"], "default": None},
                 "last_messages": {"type": "integer", "minimum": 1, "maximum": 50, "default": 10},
                 "message_max_chars": {"type": "integer", "minimum": 500, "maximum": 200000, "default": 8000},
+                "progress_events": {"type": "integer", "minimum": 0, "maximum": 100, "default": 10},
+                "progress_max_chars": {"type": "integer", "minimum": 200, "maximum": 20000, "default": 2000},
             },
             "additionalProperties": False,
         },
@@ -391,12 +408,12 @@ TOOLS: list[dict[str, Any]] = [
                 "approval_policy": {
                     "type": "string",
                     "enum": ["never", "on-request", "on-failure", "untrusted", "respect_existing", "never_auto_approve", "ask_openclaw"],
-                    "default": "never",
+                    "default": "on-request",
                 },
                 "sandbox": {
                     "type": "string",
                     "enum": ["danger-full-access", "workspace-write", "read-only", "respect_existing"],
-                    "default": "danger-full-access",
+                    "default": "read-only",
                 },
             },
             "additionalProperties": False,
@@ -433,8 +450,8 @@ TOOLS: list[dict[str, Any]] = [
                 "cwd": {"type": ["string", "null"], "default": None},
                 "model": {"type": ["string", "null"], "default": None},
                 "collaboration_mode": {"type": ["string", "null"], "enum": ["default", "plan", None], "default": None},
-                "approval_policy": {"type": ["string", "null"], "enum": ["never", "on-request", "on-failure", "untrusted", "ask_openclaw", "respect_existing", "never_auto_approve", None], "default": "never"},
-                "sandbox": {"type": ["string", "null"], "enum": ["read-only", "workspace-write", "danger-full-access", "respect_existing", None], "default": "danger-full-access"},
+                "approval_policy": {"type": ["string", "null"], "enum": ["never", "on-request", "on-failure", "untrusted", "ask_openclaw", "respect_existing", "never_auto_approve", None], "default": "on-request"},
+                "sandbox": {"type": ["string", "null"], "enum": ["read-only", "workspace-write", "danger-full-access", "respect_existing", None], "default": "read-only"},
                 "force": {"type": "boolean", "default": False},
                 "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 7200, "default": DEFAULT_TOOL_START_TIMEOUT_SECONDS},
                 "first_message_max_chars": {"type": "integer", "minimum": 500, "maximum": 200000, "default": 8000},
@@ -452,6 +469,8 @@ TOOLS: list[dict[str, Any]] = [
                 "operation_id": {"type": "string", "minLength": 1},
                 "last_messages": {"type": "integer", "minimum": 1, "maximum": 50, "default": 10},
                 "message_max_chars": {"type": "integer", "minimum": 500, "maximum": 200000, "default": 8000},
+                "progress_events": {"type": "integer", "minimum": 0, "maximum": 100, "default": 10},
+                "progress_max_chars": {"type": "integer", "minimum": 200, "maximum": 20000, "default": 2000},
                 "include_events": {"type": "boolean", "default": False},
             },
             "additionalProperties": False,
@@ -533,6 +552,22 @@ TOOLS: list[dict[str, Any]] = [
             "type": "object",
             "properties": {
                 "include_recent_events": {"type": "boolean", "default": False},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "codex_get_runtime_capabilities",
+        "description": "Read a compact cached inventory of local codex-app-server runtime capabilities: models, permission profiles, sandbox readiness, hooks, skills, provider features, and supported schema methods.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "refresh": {"type": "boolean", "default": False},
+                "cwd": {"type": ["string", "null"], "default": None},
+                "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 30, "default": 2},
+                "include_models": {"type": "boolean", "default": True},
+                "include_hooks": {"type": "boolean", "default": True},
+                "include_skills": {"type": "boolean", "default": True},
             },
             "additionalProperties": False,
         },
@@ -687,6 +722,9 @@ class ToolService:
         self.catalog = ProjectChatCatalog(self.config, self.storage)
         self._app_server: CodexAppServerClient | None = None
         self._operation_tasks: dict[str, asyncio.Task[None]] = {}
+        self._runtime_capabilities_cache: dict[str, Any] | None = None
+        self._runtime_capabilities_cache_key: str | None = None
+        self._runtime_capabilities_cache_at: float | None = None
 
     async def close(self) -> None:
         for task in list(self._operation_tasks.values()):
@@ -1231,6 +1269,10 @@ class ToolService:
                 return result
             if name == "codex_get_app_server_status":
                 result = self.codex_get_app_server_status(args)
+                LOG.info("call done name=%s elapsed_ms=%d", name, int((time.monotonic() - started) * 1000))
+                return result
+            if name == "codex_get_runtime_capabilities":
+                result = await self.codex_get_runtime_capabilities(args)
                 LOG.info("call done name=%s elapsed_ms=%d", name, int((time.monotonic() - started) * 1000))
                 return result
             if name == "codex_health_summary":
@@ -2065,34 +2107,42 @@ class ToolService:
         thread_id = str(thread_id).strip() if thread_id not in (None, "") else None
         last_messages = _bounded_int(args.get("last_messages", 10), 1, 50)
         message_max_chars = _bounded_int(args.get("message_max_chars", 8000), 500, 200000)
-        live = self._tracked_turn_status(turn_id, last_messages=last_messages, message_max_chars=message_max_chars)
+        progress_events = _bounded_int(args.get("progress_events", 10), 0, 100)
+        progress_max_chars = _bounded_int(args.get("progress_max_chars", 2000), 200, 20000)
+        live = self._tracked_turn_status(
+            turn_id,
+            last_messages=last_messages,
+            message_max_chars=message_max_chars,
+            progress_events=progress_events,
+            progress_max_chars=progress_max_chars,
+        )
         lookup_thread_id = thread_id or (str(live.get("thread_id")) if live and live.get("thread_id") else None)
         hook = self._hook_turn_status(turn_id, lookup_thread_id, last_messages=last_messages, message_max_chars=message_max_chars)
         kb = self._kb_turn_status(turn_id, lookup_thread_id, last_messages=last_messages, message_max_chars=message_max_chars)
         if live is None:
             if hook is not None:
-                return hook
+                return self._attach_progress_status(hook, turn_id, progress_events=progress_events, progress_max_chars=progress_max_chars)
             if kb is None:
                 raise turn_not_found(turn_id)
-            return kb
+            return self._attach_progress_status(kb, turn_id, progress_events=progress_events, progress_max_chars=progress_max_chars)
         if hook is not None:
             live_status = str(live.get("status") or "unknown")
             hook_status = str(hook.get("status") or "unknown")
             if live_status in {"starting", "running", "unknown", "unknown_after_app_server_exit"} and hook_status in {"completed", "failed", "aborted", "cancelled", "canceled"}:
                 hook["source"] = "app_server+hook_history"
-                return hook
+                return self._attach_progress_status(hook, turn_id, progress_events=progress_events, progress_max_chars=progress_max_chars)
             if not live.get("last_messages") and hook.get("last_messages"):
                 hook["source"] = "app_server+hook_history"
-                return hook
+                return self._attach_progress_status(hook, turn_id, progress_events=progress_events, progress_max_chars=progress_max_chars)
         if kb is not None:
             live_status = str(live.get("status") or "unknown")
             kb_status = str(kb.get("status") or "unknown")
             if live_status in {"starting", "running", "unknown"} and kb_status in {"completed", "failed", "aborted", "cancelled", "canceled"}:
                 kb["source"] = "app_server+kb_history"
-                return kb
+                return self._attach_progress_status(kb, turn_id, progress_events=progress_events, progress_max_chars=progress_max_chars)
             if not live.get("last_messages") and kb.get("last_messages"):
                 kb["source"] = "app_server+kb_history"
-                return kb
+                return self._attach_progress_status(kb, turn_id, progress_events=progress_events, progress_max_chars=progress_max_chars)
         return live
 
     async def codex_execute_plan(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -2392,6 +2442,8 @@ class ToolService:
             operation,
             last_messages=_bounded_int(args.get("last_messages", 10), 1, 50),
             message_max_chars=_bounded_int(args.get("message_max_chars", 8000), 500, 200000),
+            progress_events=_bounded_int(args.get("progress_events", 10), 0, 100),
+            progress_max_chars=_bounded_int(args.get("progress_max_chars", 2000), 200, 20000),
             include_events=bool(args.get("include_events", False)),
         )
 
@@ -2662,6 +2714,8 @@ class ToolService:
         *,
         last_messages: int,
         message_max_chars: int,
+        progress_events: int = 10,
+        progress_max_chars: int = 2000,
         include_events: bool = False,
     ) -> dict[str, Any]:
         operation_id = str(operation.get("operation_id") or "")
@@ -2677,6 +2731,8 @@ class ToolService:
                         "thread_id": thread_id,
                         "last_messages": last_messages,
                         "message_max_chars": message_max_chars,
+                        "progress_events": progress_events,
+                        "progress_max_chars": progress_max_chars,
                     }
                 )
                 if not (
@@ -2714,6 +2770,13 @@ class ToolService:
             response["dedupState"] = {"state": "not_recorded", "deduplicated": False}
         response["turnStatus"] = turn_status
         response["latestMessages"] = (turn_status or {}).get("latestMessages") or (turn_status or {}).get("last_messages") or []
+        if turn_status and "progressEvents" in turn_status:
+            response["progressEvents"] = turn_status.get("progressEvents") or []
+            response["progressEventCount"] = turn_status.get("progressEventCount", 0)
+            response["latestProgressAt"] = turn_status.get("latestProgressAt")
+            response["tokenUsage"] = turn_status.get("tokenUsage")
+            response["modelReroutes"] = turn_status.get("modelReroutes") or []
+            response["warnings"] = turn_status.get("warnings") or []
         pending_interactions = self._pending_interactions_for_context(thread_id=thread_id, turn_id=turn_id, status="pending", limit=20)
         if not pending_interactions:
             pending_interactions = (turn_status or {}).get("pendingInteractions") or []
@@ -2807,10 +2870,44 @@ class ToolService:
             return self.storage.get_operation(str(operation["operation_id"])) or operation
         return operation
 
-    def _tracked_turn_status(self, turn_id: str, *, last_messages: int, message_max_chars: int) -> dict[str, Any] | None:
+    def _attach_progress_status(
+        self,
+        status: dict[str, Any],
+        turn_id: str,
+        *,
+        progress_events: int,
+        progress_max_chars: int,
+    ) -> dict[str, Any]:
+        if progress_events <= 0 or "progressEvents" in status:
+            return status
+        status.update(
+            turn_progress_status_fields(
+                self.storage,
+                turn_id,
+                progress_events=progress_events,
+                progress_max_chars=progress_max_chars,
+            )
+        )
+        return status
+
+    def _tracked_turn_status(
+        self,
+        turn_id: str,
+        *,
+        last_messages: int,
+        message_max_chars: int,
+        progress_events: int = 10,
+        progress_max_chars: int = 2000,
+    ) -> dict[str, Any] | None:
         tracker = self._app_server.tracker if self._app_server is not None else None
         if tracker is not None:
-            status = tracker.get_turn_status(turn_id, last_messages=last_messages, message_max_chars=message_max_chars)
+            status = tracker.get_turn_status(
+                turn_id,
+                last_messages=last_messages,
+                message_max_chars=message_max_chars,
+                progress_events=progress_events,
+                progress_max_chars=progress_max_chars,
+            )
             if status is not None:
                 process = getattr(self._app_server, "process", None)
                 running = process is not None and getattr(process, "returncode", None) is None
@@ -2832,7 +2929,7 @@ class ToolService:
         last_error = _tracked_turn_last_error(turn)
         plans = [_plan_row_to_tool(row, message_max_chars) for row in self.storage.get_tracked_turn_plans(turn_id)]
         latest_plan = _latest_plan(plans)
-        return {
+        result = {
             "ok": True,
             "thread_id": turn["thread_id"],
             "threadId": turn["thread_id"],
@@ -2874,6 +2971,7 @@ class ToolService:
             "appServerGeneration": turn.get("process_generation"),
             "stalenessSeconds": _min_staleness([turn.get("updated_at")]),
         }
+        return self._attach_progress_status(result, turn_id, progress_events=progress_events, progress_max_chars=progress_max_chars)
 
     def _hook_turn_status(
         self,
@@ -3612,6 +3710,226 @@ class ToolService:
             }
         return self._app_server.status_snapshot(include_recent_events=include_recent_events)
 
+    async def codex_get_runtime_capabilities(self, args: dict[str, Any]) -> dict[str, Any]:
+        refresh = bool(args.get("refresh", False))
+        include_models = bool(args.get("include_models", True))
+        include_hooks = bool(args.get("include_hooks", True))
+        include_skills = bool(args.get("include_skills", True))
+        timeout_seconds = _bounded_int(args.get("timeout_seconds", 2), 1, 30)
+        cwd = _optional_string(args.get("cwd")) or str(self.config.projects_root)
+        if not is_allowed_path(cwd, self.config.allowed_roots):
+            raise invalid_argument("cwd is outside configured allowed roots.", cwd=redact_text(cwd, max_chars=300))
+        cache_key = json.dumps(
+            {
+                "cwd": path_key(cwd),
+                "includeModels": include_models,
+                "includeHooks": include_hooks,
+                "includeSkills": include_skills,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        now_monotonic = time.monotonic()
+        if (
+            not refresh
+            and self._runtime_capabilities_cache is not None
+            and self._runtime_capabilities_cache_key == cache_key
+            and self._runtime_capabilities_cache_at is not None
+            and now_monotonic - self._runtime_capabilities_cache_at < RUNTIME_CAPABILITIES_CACHE_TTL_SECONDS
+        ):
+            cached = copy.deepcopy(self._runtime_capabilities_cache)
+            cached["cacheState"] = {
+                "hit": True,
+                "ageSeconds": int(now_monotonic - self._runtime_capabilities_cache_at),
+                "ttlSeconds": RUNTIME_CAPABILITIES_CACHE_TTL_SECONDS,
+                "cacheKey": hashlib.sha256(cache_key.encode("utf-8")).hexdigest(),
+            }
+            return cached
+
+        generated_at = runtime_now_iso()
+        method_results: dict[str, dict[str, Any]] = {}
+        warnings: list[dict[str, Any]] = []
+        app_status_before = self.codex_get_app_server_status({"include_recent_events": False})
+        try:
+            client = await self._app()
+        except CodexMcpError as exc:
+            warnings.append(
+                {
+                    "method": "app-server/start",
+                    "code": exc.code,
+                    "message": redact_text(exc.message, max_chars=500),
+                    "retryable": exc.retryable,
+                }
+            )
+            method_results["app-server/start"] = {
+                "status": "error",
+                "elapsedMs": 0,
+                "errorCode": exc.code,
+                "retryable": exc.retryable,
+            }
+            runtime_capabilities = {
+                "status": "unavailable",
+                "generatedAt": generated_at,
+                "appServer": {
+                    "running": False,
+                    "started": app_status_before.get("started"),
+                    "processGeneration": app_status_before.get("processGeneration"),
+                    "initialize": None,
+                },
+                "schemaMethods": schema_methods_block(),
+                "models": None,
+                "permissionProfiles": None,
+                "sandboxReadiness": None,
+                "hooks": None,
+                "skills": None,
+                "modelProviderCapabilities": None,
+            }
+            return {
+                "ok": True,
+                "runtimeCapabilities": runtime_capabilities,
+                "cacheState": {
+                    "hit": False,
+                    "ageSeconds": 0,
+                    "ttlSeconds": RUNTIME_CAPABILITIES_CACHE_TTL_SECONDS,
+                    "cacheKey": hashlib.sha256(cache_key.encode("utf-8")).hexdigest(),
+                },
+                "methodResults": method_results,
+                "warnings": warnings,
+                "recommendedPollAfterSeconds": 0,
+                "pollRecommended": False,
+            }
+
+        async def run_method(method: str, call: Any, compact: Any) -> Any:
+            started = time.monotonic()
+            try:
+                raw = await call()
+                method_results[method] = {"status": "ok", "elapsedMs": int((time.monotonic() - started) * 1000)}
+                return compact(raw)
+            except CodexMcpError as exc:
+                status = "timeout" if exc.code == "CODEX_TIMEOUT" else "error"
+                method_results[method] = {
+                    "status": status,
+                    "elapsedMs": int((time.monotonic() - started) * 1000),
+                    "errorCode": exc.code,
+                    "retryable": exc.retryable,
+                }
+                warnings.append(
+                    {
+                        "method": method,
+                        "code": exc.code,
+                        "status": status,
+                        "message": redact_text(exc.message, max_chars=500),
+                        "retryable": exc.retryable,
+                    }
+                )
+                return None
+            except Exception as exc:  # noqa: BLE001 - inventory must be best-effort.
+                method_results[method] = {
+                    "status": "error",
+                    "elapsedMs": int((time.monotonic() - started) * 1000),
+                    "errorCode": type(exc).__name__,
+                    "retryable": False,
+                }
+                warnings.append(
+                    {
+                        "method": method,
+                        "code": type(exc).__name__,
+                        "status": "error",
+                        "message": redact_text(str(exc), max_chars=500),
+                        "retryable": False,
+                    }
+                )
+                return None
+
+        def skip_method(method: str, reason: str) -> None:
+            method_results[method] = {"status": "skipped", "reason": reason, "elapsedMs": 0}
+
+        models = None
+        if include_models:
+            models = await run_method(
+                "model/list",
+                lambda: client.model_list(limit=100, include_hidden=True, timeout_seconds=timeout_seconds),
+                compact_models,
+            )
+        else:
+            skip_method("model/list", "include_models=false")
+
+        permission_profiles = await run_method(
+            "permissionProfile/list",
+            lambda: client.permission_profile_list(cwd=cwd, limit=100, timeout_seconds=timeout_seconds),
+            compact_permission_profiles,
+        )
+        sandbox_readiness = await run_method(
+            "windowsSandbox/readiness",
+            lambda: client.windows_sandbox_readiness(timeout_seconds=timeout_seconds),
+            compact_sandbox_readiness,
+        )
+        hooks = None
+        if include_hooks:
+            hooks = await run_method(
+                "hooks/list",
+                lambda: client.hooks_list(cwds=[cwd], timeout_seconds=timeout_seconds),
+                compact_hooks,
+            )
+        else:
+            skip_method("hooks/list", "include_hooks=false")
+
+        skills = None
+        if include_skills:
+            skills = await run_method(
+                "skills/list",
+                lambda: client.skills_list(cwds=[cwd], force_reload=refresh, timeout_seconds=timeout_seconds),
+                compact_skills,
+            )
+        else:
+            skip_method("skills/list", "include_skills=false")
+
+        provider_capabilities = await run_method(
+            "modelProvider/capabilities/read",
+            lambda: client.model_provider_capabilities_read(timeout_seconds=timeout_seconds),
+            compact_provider_capabilities,
+        )
+        app_status_after = self.codex_get_app_server_status({"include_recent_events": False})
+        runtime_capabilities = {
+            "status": "partial" if warnings else "ok",
+            "generatedAt": generated_at,
+            "appServer": {
+                "running": app_status_after.get("running"),
+                "started": app_status_after.get("started"),
+                "processGeneration": app_status_after.get("processGeneration"),
+                "platform": compact_initialize_result(getattr(client, "initialize_result", None)).get("platform"),
+                "userAgent": compact_initialize_result(getattr(client, "initialize_result", None)).get("userAgent"),
+                "initialize": compact_initialize_result(getattr(client, "initialize_result", None)),
+            },
+            "schemaMethods": schema_methods_block(),
+            "models": models,
+            "permissionProfiles": permission_profiles,
+            "sandboxReadiness": sandbox_readiness,
+            "hooks": hooks,
+            "skills": skills,
+            "modelProviderCapabilities": provider_capabilities,
+        }
+        result = {
+            "ok": True,
+            "runtimeCapabilities": runtime_capabilities,
+            "cacheState": {
+                "hit": False,
+                "ageSeconds": 0,
+                "ttlSeconds": RUNTIME_CAPABILITIES_CACHE_TTL_SECONDS,
+                "cacheKey": hashlib.sha256(cache_key.encode("utf-8")).hexdigest(),
+            },
+            "methodResults": method_results,
+            "warnings": warnings,
+            "recommendedPollAfterSeconds": 0,
+            "pollRecommended": False,
+        }
+        result = redact_payload(result)
+        self._runtime_capabilities_cache = copy.deepcopy(result)
+        self._runtime_capabilities_cache_key = cache_key
+        self._runtime_capabilities_cache_at = time.monotonic()
+        return result
+
     def codex_health_summary(self, args: dict[str, Any]) -> dict[str, Any]:
         since_minutes = _bounded_int(args.get("since_minutes", 120), 1, 10080)
         stale_after_minutes = _bounded_int(args.get("stale_after_minutes", 30), 1, 10080)
@@ -3665,6 +3983,11 @@ class ToolService:
             "activeTurnCount": len(active_turns),
             "pendingInteractionCount": len(pending),
         }
+        runtime_cache_age = (
+            int(time.monotonic() - self._runtime_capabilities_cache_at)
+            if self._runtime_capabilities_cache_at is not None and self._runtime_capabilities_cache is not None
+            else None
+        )
         result = {
             "ok": True,
             "generatedAt": generated_at,
@@ -3700,6 +4023,10 @@ class ToolService:
             "lastHookEventAt": hook_history["lastHookEventAt"],
             "hookInstalled": hook_history["installed"],
             "hookDbWritable": hook_history["dbWritable"],
+            "runtimeCapabilities": runtime_health_subset(
+                self._runtime_capabilities_cache,
+                cache_age_seconds=runtime_cache_age,
+            ),
             "configHints": {
                 "defaultModel": self.config.default_model,
                 "defaultApprovalPolicy": self.config.default_approval_policy,
@@ -3814,6 +4141,7 @@ class ToolService:
         )
         hook_history = self._hook_history_snapshot()
         correlation = self._diagnostic_correlation(context)
+        progress_journal = self._progress_journal_snapshot(context, limit=event_limit)
         timeline = (
             self._diagnostic_timeline(context=context, app_events=events, pending_interactions=pending, limit=timeline_limit)
             if bool(args.get("include_timeline", True))
@@ -3861,6 +4189,7 @@ class ToolService:
             "workflowSummary": [_workflow_summary_to_tool(row) for row in workflows if row is not None],
             "promptSubmissions": [_prompt_submission_summary_to_tool(row) for row in context["promptSubmissions"]],
             "correlation": correlation,
+            "progressJournal": progress_journal,
             "timeline": timeline,
             "diagnosisConfidence": diagnosis_confidence,
             "logPointers": {
@@ -4174,6 +4503,37 @@ class ToolService:
             }
         )
 
+    def _progress_journal_snapshot(self, context: dict[str, Any], *, limit: int) -> dict[str, Any]:
+        turn_id = _optional_string(context.get("turnId"))
+        thread_id = _optional_string(context.get("threadId"))
+        rows = self.storage.list_tracked_turn_progress_events(
+            thread_id=thread_id if not turn_id else None,
+            turn_id=turn_id,
+            limit=limit,
+        )
+        if turn_id:
+            summary = turn_progress_status_fields(self.storage, turn_id, progress_events=min(limit, 100), progress_max_chars=1000)
+        else:
+            summary = {
+                "progressEvents": [progress_event_to_tool(row, 1000) for row in rows],
+                "progressEventCount": self.storage.count_tracked_turn_progress_events(thread_id=thread_id),
+                "latestProgressAt": rows[-1].get("created_at") if rows else None,
+                "tokenUsage": None,
+                "modelReroutes": [],
+                "warnings": [progress_event_to_tool(row, 1000) for row in rows if row.get("category") == "warning"][-10:],
+            }
+        return redact_payload(
+            {
+                "returnedEventCount": len(rows),
+                "events": [progress_event_to_tool(row, 1000) for row in rows],
+                "eventCount": summary.get("progressEventCount", len(rows)),
+                "latestProgressAt": summary.get("latestProgressAt"),
+                "tokenUsage": summary.get("tokenUsage"),
+                "modelReroutes": summary.get("modelReroutes") or [],
+                "warnings": summary.get("warnings") or [],
+            }
+        )
+
     def _diagnostic_timeline(
         self,
         *,
@@ -4236,6 +4596,30 @@ class ToolService:
                     thread_id=tracked_turn.get("thread_id"),
                     turn_id=tracked_turn.get("turn_id"),
                     details={"status": tracked_turn.get("status"), "lastError": _tracked_turn_last_error(tracked_turn)},
+                )
+            )
+        for progress in self.storage.list_tracked_turn_progress_events(
+            thread_id=context.get("threadId") if not context.get("turnId") else None,
+            turn_id=context.get("turnId"),
+            limit=min(limit, 100),
+        ):
+            event = progress_event_to_tool(progress, 1000)
+            entries.append(
+                _timeline_entry(
+                    progress.get("created_at"),
+                    "turn_progress",
+                    str(progress.get("category") or progress.get("event_type") or "progress"),
+                    operation_id=context.get("operationId"),
+                    workflow_id=context.get("workflowId"),
+                    thread_id=progress.get("thread_id"),
+                    turn_id=progress.get("turn_id"),
+                    details={
+                        "eventType": progress.get("event_type"),
+                        "severity": progress.get("severity"),
+                        "itemId": progress.get("item_id"),
+                        "text": event.get("text"),
+                        "metadata": event.get("metadata"),
+                    },
                 )
             )
         for prompt in context.get("promptSubmissions") or []:
@@ -5159,30 +5543,30 @@ def _redacted_preview(value: str, limit: int = 120) -> str:
 
 
 def _approval_policy_for_send(value: Any, thread_row: Any, default_policy: str) -> str:
-    selected = str(value or default_policy or "never")
+    selected = str(value or default_policy or "on-request")
     if value == "respect_existing":
         existing = getattr(thread_row, "approval_mode", None)
         if existing in {"never", "on-request", "on-failure", "untrusted"}:
             return str(existing)
         if default_policy in {"never", "on-request", "on-failure", "untrusted"}:
             return default_policy
-        return "never"
+        return "on-request"
     if selected == "never_auto_approve":
         return "never"
     if selected == "ask_openclaw":
         return "on-request"
     if selected in {"never", "on-request", "on-failure", "untrusted"}:
         return selected
-    return "never"
+    return "on-request"
 
 
 def _approval_policy_for_start(value: Any, default_policy: str) -> str:
-    selected = str(value or default_policy or "never")
+    selected = str(value or default_policy or "on-request")
     if selected == "ask_openclaw":
         return "on-request"
     if selected in {"never", "on-request", "on-failure", "untrusted"}:
         return selected
-    return "never"
+    return "on-request"
 
 
 def _sandbox_policy_for_send(value: Any, thread_row: Any, default_policy: dict[str, Any]) -> dict[str, Any]:
@@ -5213,7 +5597,7 @@ def _sandbox_value_from_policy(policy: dict[str, Any]) -> str:
         return "workspace-write"
     if policy_type == "dangerFullAccess":
         return "danger-full-access"
-    return "danger-full-access"
+    return "read-only"
 
 
 def _collaboration_mode(value: Any, *, model: str | None, config: ServerConfig) -> dict[str, Any] | None:

@@ -84,8 +84,10 @@ MCP client / orchestrator
 - Plan Mode workflows: план, polling, approve, execution, финальный отчет.
 - Pending approvals и вопросы как pollable MCP state.
 - Interrupt turns по `threadId`/`turnId`, `operationId` или `workflowId`.
+- Runtime inventory: модели, permission profiles, sandbox readiness, hooks, skills, provider features и поддерживаемые app-server methods.
 - Health checks, diagnostics, issue analysis и dry-run repairs.
 - Собственная hook history в SQLite для поиска, summaries и fallback reads.
+- Журнал progress events из app-server: deltas, warnings, model reroutes и token usage.
 - Structured MCP errors, с которыми automation code может работать напрямую.
 
 Write/control действия идут через `codex-app-server`. Сервер не пишет во
@@ -239,6 +241,7 @@ codex_answer_pending_interaction
 Диагностика начинается с:
 
 ```text
+codex_get_runtime_capabilities
 codex_health_summary
 codex_collect_diagnostics
 codex_analyze_issue
@@ -246,6 +249,43 @@ codex_repair_issue
 ```
 
 Repair actions по умолчанию идут с `dry_run=true`.
+
+## Runtime capabilities
+
+Вызывайте `codex_get_runtime_capabilities` перед orchestration или после
+reconnect. Tool при необходимости стартует MCP-owned app-server, делает короткие
+best-effort inventory вызовы и кеширует snapshot на пять минут.
+
+Ответ содержит:
+
+- количество моделей, default model, hidden flags, input modalities, reasoning efforts и число service tiers;
+- permission profiles с `id` и `description`;
+- готовность Windows sandbox;
+- provider capabilities для web search, image generation и namespace tools;
+- счетчики hooks и skills без raw hook commands и абсолютных путей к skills;
+- поддерживаемые app-server schema methods с компактным source, version и hash.
+
+Если один inventory method падает или уходит в timeout, tool все равно
+возвращает `ok=true`, `runtimeCapabilities.status="partial"` и машинно-читаемый
+warning в `methodResults`. Передайте `refresh=true`, чтобы обойти cache.
+`codex_health_summary` показывает небольшой блок `runtimeCapabilities` из
+последнего snapshot и сам app-server не стартует.
+
+## Progress journal
+
+`codex_get_turn_status` и `codex_get_operation_status` по умолчанию возвращают
+компактный блок `progressEvents`. В него попадает видимый для app-server ход
+работы: assistant text deltas, plan deltas, reasoning summary text, token usage,
+model reroutes и warnings.
+
+Журнал помогает с orchestration и troubleshooting. Он не извлекает скрытую
+chain-of-thought. Также он по умолчанию не сохраняет raw tool payloads, command
+output и полные unified diffs. Diff-события сворачиваются в безопасные счетчики:
+количество измененных строк, размер diff и похожую статистику.
+
+Если клиенту нужен старый status только с сообщениями, передайте
+`progress_events=0`. Для ограничения возвращаемого текста используйте
+`progress_max_chars`.
 
 ## Tool surface
 
@@ -259,6 +299,7 @@ Stable orchestration tools:
 - `codex_list_pending_interactions`
 - `codex_answer_pending_interaction`
 - `codex_interrupt_turn`
+- `codex_get_runtime_capabilities`
 - `codex_health_summary`
 - `codex_collect_diagnostics`
 - `codex_repair_issue`
@@ -332,8 +373,8 @@ stable/compatibility tools.
 - `CODEX_MCP_HOOK_HISTORY_MAX_TEXT_CHARS`: лимит записи одного hook-сообщения.
 - `CODEX_KB_HISTORY_PROJECTS_ROOT`: опциональный legacy-корень нормализованной KB history.
 - `CODEX_BINARY_PATH`: явный путь к Codex binary.
-- `CODEX_MCP_DEFAULT_SANDBOX`: default sandbox для write-операций. По умолчанию `danger-full-access`.
-- `CODEX_MCP_DEFAULT_APPROVAL_POLICY`: default approval policy для write-операций. По умолчанию `never`.
+- `CODEX_MCP_DEFAULT_SANDBOX`: default sandbox для write-операций. По умолчанию `read-only`.
+- `CODEX_MCP_DEFAULT_APPROVAL_POLICY`: default approval policy для write-операций. По умолчанию `on-request`.
 - `CODEX_MCP_DEFAULT_MODEL`: default Codex model для app-server.
 - `CODEX_MCP_DEFAULT_EFFORT`: default effort level.
 - `CODEX_MCP_APPROVAL_RESPONSE_TIMEOUT_SECONDS`: timeout pending interactions.
@@ -342,14 +383,14 @@ stable/compatibility tools.
 
 Write policy значения являются дефолтами, а не жесткими ограничениями.
 MCP-клиент может переопределить `sandbox` или `approval_policy` в конкретном
-вызове, например для разовой задачи в `read-only` или `on-request`.
+вызове, когда доверенному workflow нужен другой режим.
 
 Пример:
 
 ```powershell
 $env:CODEX_CONTROL_PLANE_MCP_CONFIG = Join-Path (Get-Location) "examples\codex-control-plane-mcp.config.json"
-$env:CODEX_MCP_DEFAULT_SANDBOX = "danger-full-access"
-$env:CODEX_MCP_DEFAULT_APPROVAL_POLICY = "never"
+$env:CODEX_MCP_DEFAULT_SANDBOX = "read-only"
+$env:CODEX_MCP_DEFAULT_APPROVAL_POLICY = "on-request"
 py -m codex_control_plane_mcp.server
 ```
 

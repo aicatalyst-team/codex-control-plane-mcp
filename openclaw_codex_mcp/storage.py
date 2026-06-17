@@ -146,6 +146,31 @@ ON tracked_turn_messages(turn_id, id);
 CREATE INDEX IF NOT EXISTS idx_tracked_turn_messages_thread
 ON tracked_turn_messages(thread_id, id);
 
+CREATE TABLE IF NOT EXISTS tracked_turn_progress_events(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  event_hash TEXT NOT NULL UNIQUE,
+  turn_id TEXT NOT NULL,
+  thread_id TEXT NOT NULL,
+  event_type TEXT NOT NULL,
+  category TEXT NOT NULL,
+  severity TEXT NOT NULL DEFAULT 'info',
+  item_id TEXT,
+  sequence INTEGER NOT NULL DEFAULT 0,
+  text TEXT,
+  metadata_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL,
+  truncated INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_tracked_turn_progress_turn
+ON tracked_turn_progress_events(turn_id, id);
+
+CREATE INDEX IF NOT EXISTS idx_tracked_turn_progress_thread
+ON tracked_turn_progress_events(thread_id, id);
+
+CREATE INDEX IF NOT EXISTS idx_tracked_turn_progress_category
+ON tracked_turn_progress_events(category, severity, created_at);
+
 CREATE TABLE IF NOT EXISTS tracked_plan_items(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   item_id TEXT NOT NULL,
@@ -906,6 +931,43 @@ class McpStorage:
             ON pending_interaction_events(interaction_id, id)
             """
         )
+        self.connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tracked_turn_progress_events(
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              event_hash TEXT NOT NULL UNIQUE,
+              turn_id TEXT NOT NULL,
+              thread_id TEXT NOT NULL,
+              event_type TEXT NOT NULL,
+              category TEXT NOT NULL,
+              severity TEXT NOT NULL DEFAULT 'info',
+              item_id TEXT,
+              sequence INTEGER NOT NULL DEFAULT 0,
+              text TEXT,
+              metadata_json TEXT NOT NULL DEFAULT '{}',
+              created_at TEXT NOT NULL,
+              truncated INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+        self.connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_tracked_turn_progress_turn
+            ON tracked_turn_progress_events(turn_id, id)
+            """
+        )
+        self.connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_tracked_turn_progress_thread
+            ON tracked_turn_progress_events(thread_id, id)
+            """
+        )
+        self.connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_tracked_turn_progress_category
+            ON tracked_turn_progress_events(category, severity, created_at)
+            """
+        )
 
     def _add_column_if_missing(self, table: str, column: str, declaration: str) -> None:
         columns = {
@@ -1128,6 +1190,126 @@ class McpStorage:
             (turn_id,),
         ).fetchone()
         return int(row["count"] if row is not None else 0)
+
+    def record_tracked_turn_progress_event(self, row: dict[str, Any]) -> bool:
+        payload = {"severity": "info", "metadata_json": "{}", "truncated": 0, **row}
+        cursor = self.connection.execute(
+            """
+            INSERT OR IGNORE INTO tracked_turn_progress_events(
+              event_hash, turn_id, thread_id, event_type, category, severity,
+              item_id, sequence, text, metadata_json, created_at, truncated
+            )
+            VALUES(
+              :event_hash, :turn_id, :thread_id, :event_type, :category, :severity,
+              :item_id, :sequence, :text, :metadata_json, :created_at, :truncated
+            )
+            """,
+            payload,
+        )
+        inserted = cursor.rowcount > 0
+        if inserted:
+            event_id = cursor.lastrowid
+            self.connection.execute(
+                """
+                UPDATE tracked_turns SET
+                  updated_at = COALESCE(:created_at, updated_at),
+                  last_event_seq = MAX(last_event_seq, :event_id)
+                WHERE turn_id = :turn_id
+                """,
+                {**payload, "event_id": event_id},
+            )
+        self.connection.commit()
+        return inserted
+
+    def list_tracked_turn_progress_events(
+        self,
+        *,
+        thread_id: str | None = None,
+        turn_id: str | None = None,
+        categories: list[str] | tuple[str, ...] | None = None,
+        since: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if thread_id:
+            clauses.append("thread_id = ?")
+            params.append(thread_id)
+        if turn_id:
+            clauses.append("turn_id = ?")
+            params.append(turn_id)
+        if categories:
+            placeholders = ",".join("?" for _ in categories)
+            clauses.append(f"category IN ({placeholders})")
+            params.extend(categories)
+        if since:
+            clauses.append("created_at >= ?")
+            params.append(since)
+        where = "WHERE " + " AND ".join(clauses) if clauses else ""
+        rows = self.connection.execute(
+            f"""
+            SELECT *
+            FROM tracked_turn_progress_events
+            {where}
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (*params, limit),
+        ).fetchall()
+        return [dict(row) for row in reversed(rows)]
+
+    def count_tracked_turn_progress_events(self, *, thread_id: str | None = None, turn_id: str | None = None) -> int:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if thread_id:
+            clauses.append("thread_id = ?")
+            params.append(thread_id)
+        if turn_id:
+            clauses.append("turn_id = ?")
+            params.append(turn_id)
+        where = "WHERE " + " AND ".join(clauses) if clauses else ""
+        row = self.connection.execute(f"SELECT COUNT(*) AS count FROM tracked_turn_progress_events {where}", params).fetchone()
+        return int(row["count"] if row is not None else 0)
+
+    def tracked_turn_progress_summary(self, turn_id: str, *, warning_limit: int = 10, model_reroute_limit: int = 10) -> dict[str, Any]:
+        count = self.count_tracked_turn_progress_events(turn_id=turn_id)
+        latest = self.connection.execute(
+            """
+            SELECT created_at
+            FROM tracked_turn_progress_events
+            WHERE turn_id = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (turn_id,),
+        ).fetchone()
+        token_usage = self.connection.execute(
+            """
+            SELECT *
+            FROM tracked_turn_progress_events
+            WHERE turn_id = ? AND category = 'token_usage'
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (turn_id,),
+        ).fetchone()
+        warnings = self.list_tracked_turn_progress_events(
+            turn_id=turn_id,
+            categories=("warning",),
+            limit=warning_limit,
+        )
+        model_reroutes = self.list_tracked_turn_progress_events(
+            turn_id=turn_id,
+            categories=("model_reroute",),
+            limit=model_reroute_limit,
+        )
+        return {
+            "eventCount": count,
+            "latestProgressAt": latest["created_at"] if latest is not None else None,
+            "tokenUsageEvent": dict(token_usage) if token_usage is not None else None,
+            "warnings": warnings,
+            "modelReroutes": model_reroutes,
+        }
 
     def append_tracked_plan_delta(self, row: dict[str, Any]) -> bool:
         cursor = self.connection.execute(

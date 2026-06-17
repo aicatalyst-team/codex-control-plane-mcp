@@ -88,8 +88,10 @@ Recommended first-run posture:
 - Plan Mode workflows: start plan, poll, approve, execute, read final report.
 - Pending approvals and questions exposed as pollable MCP state.
 - Turn interrupts by `threadId`/`turnId`, `operationId`, or `workflowId`.
+- Runtime inventory for models, permission profiles, sandbox readiness, hooks, skills, provider features, and supported app-server methods.
 - Health checks, diagnostics, issue analysis, and dry-run repairs.
 - MCP-owned hook history in SQLite for search, summaries, and fallback reads.
+- Redacted app-server progress journal for deltas, warnings, model reroutes, and token usage.
 - Structured MCP errors that automation code can branch on.
 
 Write and control actions go through `codex-app-server`. The server does not
@@ -242,6 +244,7 @@ codex_answer_pending_interaction
 Start diagnostics with:
 
 ```text
+codex_get_runtime_capabilities
 codex_health_summary
 codex_collect_diagnostics
 codex_analyze_issue
@@ -249,6 +252,42 @@ codex_repair_issue
 ```
 
 Repair actions default to `dry_run=true`.
+
+## Runtime capabilities
+
+Use `codex_get_runtime_capabilities` before orchestration or after reconnect. It
+starts the MCP-owned app-server if needed, calls short best-effort inventory
+methods, and returns a cached snapshot for five minutes.
+
+The response includes:
+
+- model count, default model, hidden flags, input modalities, reasoning efforts, and service tier count;
+- permission profiles by `id` and `description`;
+- Windows sandbox readiness;
+- provider capabilities for web search, image generation, and namespace tools;
+- hook and skill counts without raw hook commands or absolute skill paths;
+- supported app-server schema methods with a compact source, version, and hash.
+
+If one inventory method times out or fails, the tool still returns `ok=true`
+with `runtimeCapabilities.status="partial"` and a machine-readable warning in
+`methodResults`. Set `refresh=true` to bypass the cache. `codex_health_summary`
+shows a small `runtimeCapabilities` subset from the last collected snapshot and
+does not start app-server on its own.
+
+## Progress journal
+
+`codex_get_turn_status` and `codex_get_operation_status` include a compact
+`progressEvents` block by default. It captures app-server-visible progress such
+as assistant text deltas, plan deltas, reasoning summary text, token usage,
+model reroutes, and warnings.
+
+The journal helps with orchestration and troubleshooting. It does not extract
+hidden chain-of-thought. It also does not store raw tool payloads, command
+output, or full unified diffs by default. Diff events are reduced to safe
+counts, such as changed line count and diff size.
+
+Use `progress_events=0` when a client wants the older, message-only status
+shape. Use `progress_max_chars` to cap returned progress text.
 
 ## Tool surface
 
@@ -262,6 +301,7 @@ Stable orchestration tools:
 - `codex_list_pending_interactions`
 - `codex_answer_pending_interaction`
 - `codex_interrupt_turn`
+- `codex_get_runtime_capabilities`
 - `codex_health_summary`
 - `codex_collect_diagnostics`
 - `codex_repair_issue`
@@ -335,8 +375,8 @@ Common variables:
 - `CODEX_MCP_HOOK_HISTORY_MAX_TEXT_CHARS`: per-message hook capture limit.
 - `CODEX_KB_HISTORY_PROJECTS_ROOT`: optional legacy normalized KB history root.
 - `CODEX_BINARY_PATH`: optional explicit Codex binary path.
-- `CODEX_MCP_DEFAULT_SANDBOX`: default write sandbox. Defaults to `danger-full-access`.
-- `CODEX_MCP_DEFAULT_APPROVAL_POLICY`: default write approval policy. Defaults to `never`.
+- `CODEX_MCP_DEFAULT_SANDBOX`: default write sandbox. Defaults to `read-only`.
+- `CODEX_MCP_DEFAULT_APPROVAL_POLICY`: default write approval policy. Defaults to `on-request`.
 - `CODEX_MCP_DEFAULT_MODEL`: default Codex model passed to app-server.
 - `CODEX_MCP_DEFAULT_EFFORT`: default effort level.
 - `CODEX_MCP_APPROVAL_RESPONSE_TIMEOUT_SECONDS`: pending interaction timeout.
@@ -344,15 +384,15 @@ Common variables:
 - `DEEPSEEK_SUMMARY_ENABLED`: enables or disables remote summary calls.
 
 The write policy values are defaults, not hard limits. A client call can pass
-`sandbox` or `approval_policy` explicitly, for example to run one task in
-`read-only` or `on-request` mode.
+`sandbox` or `approval_policy` explicitly when a trusted workflow needs a
+different posture.
 
 Example:
 
 ```powershell
 $env:CODEX_CONTROL_PLANE_MCP_CONFIG = Join-Path (Get-Location) "examples\codex-control-plane-mcp.config.json"
-$env:CODEX_MCP_DEFAULT_SANDBOX = "danger-full-access"
-$env:CODEX_MCP_DEFAULT_APPROVAL_POLICY = "never"
+$env:CODEX_MCP_DEFAULT_SANDBOX = "read-only"
+$env:CODEX_MCP_DEFAULT_APPROVAL_POLICY = "on-request"
 py -m codex_control_plane_mcp.server
 ```
 

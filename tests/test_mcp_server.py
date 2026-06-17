@@ -192,6 +192,14 @@ class FakeAppServer:
         self.turn_start_calls: list[dict] = []
         self.turn_steer_calls: list[dict] = []
         self.thread_start_calls: list[dict] = []
+        self.inventory_calls: list[str] = []
+        self.inventory_failures: dict[str, Exception] = {}
+        self.initialize_result = {
+            "protocolVersion": "2025-01-10",
+            "serverInfo": {"name": "codex-app-server", "version": "test"},
+            "platform": "windows",
+            "userAgent": "codex-app-server-test",
+        }
         self._turn_counter = 0
 
     async def start(self) -> None:
@@ -260,6 +268,140 @@ class FakeAppServer:
         )
         return {"turnId": expected_turn_id}
 
+    async def model_list(
+        self,
+        *,
+        limit: int | None = 100,
+        include_hidden: bool | None = False,
+        cursor: str | None = None,
+        timeout_seconds: float | None = 2,
+    ) -> dict:
+        self._maybe_fail_inventory("model/list")
+        self.inventory_calls.append("model/list")
+        return {
+            "data": [
+                {
+                    "id": "gpt-5",
+                    "model": "gpt-5",
+                    "displayName": "GPT-5",
+                    "isDefault": True,
+                    "hidden": False,
+                    "inputModalities": ["text", "image"],
+                    "defaultReasoningEffort": "medium",
+                    "supportedReasoningEfforts": [{"id": "low"}, {"id": "medium"}, {"id": "high"}],
+                    "serviceTiers": [{"id": "default"}, {"id": "priority"}],
+                },
+                {
+                    "id": "hidden-model",
+                    "model": "hidden-model",
+                    "displayName": "Hidden",
+                    "isDefault": False,
+                    "hidden": True,
+                    "inputModalities": ["text"],
+                    "defaultReasoningEffort": "low",
+                    "supportedReasoningEfforts": ["low"],
+                    "serviceTiers": [],
+                },
+            ],
+            "nextCursor": None,
+        }
+
+    async def permission_profile_list(
+        self,
+        *,
+        cwd: str | None = None,
+        limit: int | None = 100,
+        cursor: str | None = None,
+        timeout_seconds: float | None = 2,
+    ) -> dict:
+        self._maybe_fail_inventory("permissionProfile/list")
+        self.inventory_calls.append("permissionProfile/list")
+        return {
+            "data": [
+                {"id": "read-only", "description": "Read-only checks"},
+                {"id": "danger-full-access", "description": "Full local access"},
+            ],
+            "nextCursor": None,
+        }
+
+    async def windows_sandbox_readiness(self, *, timeout_seconds: float | None = 2) -> dict:
+        self._maybe_fail_inventory("windowsSandbox/readiness")
+        self.inventory_calls.append("windowsSandbox/readiness")
+        return {"status": "ready"}
+
+    async def hooks_list(self, *, cwds: list[str], timeout_seconds: float | None = 2) -> dict:
+        self._maybe_fail_inventory("hooks/list")
+        self.inventory_calls.append("hooks/list")
+        return {
+            "data": [
+                {
+                    "cwd": cwds[0] if cwds else "",
+                    "warnings": ["hook warning"],
+                    "errors": [],
+                    "hooks": [
+                        {
+                            "eventName": "UserPromptSubmit",
+                            "source": "user",
+                            "trustStatus": "trusted",
+                            "enabled": True,
+                            "handlerType": "command",
+                            "isManaged": True,
+                            "command": r"C:\Secret\run-hook.ps1 --token sk-secret",
+                            "sourcePath": r"C:\Secret\hooks.json",
+                        },
+                        {
+                            "eventName": "Stop",
+                            "source": "project",
+                            "trustStatus": "untrusted",
+                            "enabled": False,
+                            "handlerType": "command",
+                            "isManaged": False,
+                            "command": r"D:\private\stop.ps1",
+                            "sourcePath": r"D:\private\hooks.json",
+                        },
+                    ],
+                }
+            ]
+        }
+
+    async def skills_list(self, *, cwds: list[str], force_reload: bool = False, timeout_seconds: float | None = 2) -> dict:
+        self._maybe_fail_inventory("skills/list")
+        self.inventory_calls.append("skills/list")
+        return {
+            "data": [
+                {
+                    "cwd": cwds[0] if cwds else "",
+                    "errors": [],
+                    "skills": [
+                        {
+                            "name": "humanizer",
+                            "scope": "user",
+                            "enabled": True,
+                            "path": r"C:\Users\you\.codex\skills\humanizer\SKILL.md",
+                            "description": "Make prose natural",
+                        },
+                        {
+                            "name": "project-skill",
+                            "scope": "project",
+                            "enabled": False,
+                            "path": r"D:\private\project\.codex\skills\project-skill\SKILL.md",
+                            "description": "Project skill",
+                        },
+                    ],
+                }
+            ]
+        }
+
+    async def model_provider_capabilities_read(self, *, timeout_seconds: float | None = 2) -> dict:
+        self._maybe_fail_inventory("modelProvider/capabilities/read")
+        self.inventory_calls.append("modelProvider/capabilities/read")
+        return {"webSearch": True, "imageGeneration": False, "namespaceTools": True}
+
+    def _maybe_fail_inventory(self, method: str) -> None:
+        failure = self.inventory_failures.get(method)
+        if failure is not None:
+            raise failure
+
     def status_snapshot(self, *, include_recent_events: bool = False) -> dict:
         return {
             "ok": True,
@@ -322,6 +464,8 @@ class ConfigDefaultsTests(unittest.TestCase):
                 self.assertEqual(root / "_kb_history" / "projects", config.kb_history_projects_root)
                 self.assertEqual([root], config.allowed_roots)
                 self.assertEqual(root / "state" / "codex-mcp-state.sqlite3", config.state_db_path)
+                self.assertEqual("on-request", config.default_approval_policy)
+                self.assertEqual({"type": "readOnly"}, config.default_sandbox_policy)
         finally:
             for key, value in previous.items():
                 if value is None:
@@ -557,6 +701,68 @@ class OperationLeaseStorageTests(unittest.TestCase):
         self.assertTrue(heartbeat)
         self.assertIsNotNone(second)
         self.assertEqual("worker-2", second["lease_owner"])
+
+    def test_progress_events_are_idempotent_and_summarized(self) -> None:
+        with TemporaryDirectory() as tmp:
+            storage = McpStorage(Path(tmp) / "mcp.sqlite")
+            storage.connect()
+            try:
+                storage.upsert_tracked_turn(
+                    {
+                        "turn_id": "turn-progress",
+                        "thread_id": "thread-progress",
+                        "chat_id": "thread-progress",
+                        "project_id": "project",
+                        "project_path": str(Path(tmp)),
+                        "status": "running",
+                        "started_at": "2026-05-25T00:00:00+00:00",
+                        "updated_at": "2026-05-25T00:00:00+00:00",
+                        "completed_at": None,
+                        "first_message_at": None,
+                        "final_message": None,
+                        "last_error": None,
+                        "source": "app_server",
+                    }
+                )
+                row = {
+                    "event_hash": "progress-hash",
+                    "turn_id": "turn-progress",
+                    "thread_id": "thread-progress",
+                    "event_type": "warning",
+                    "category": "warning",
+                    "severity": "warning",
+                    "item_id": None,
+                    "sequence": 0,
+                    "text": "safe warning",
+                    "metadata_json": "{}",
+                    "created_at": "2026-05-25T00:00:01+00:00",
+                    "truncated": 0,
+                }
+                first = storage.record_tracked_turn_progress_event(row)
+                duplicate = storage.record_tracked_turn_progress_event(row)
+                storage.record_tracked_turn_progress_event(
+                    {
+                        **row,
+                        "event_hash": "token-hash",
+                        "event_type": "thread/tokenUsage/updated",
+                        "category": "token_usage",
+                        "severity": "info",
+                        "text": "Token usage updated.",
+                        "metadata_json": json.dumps({"tokenUsage": {"total": {"totalTokens": 42}}}),
+                        "created_at": "2026-05-25T00:00:02+00:00",
+                    }
+                )
+                events = storage.list_tracked_turn_progress_events(turn_id="turn-progress", limit=10)
+                summary = storage.tracked_turn_progress_summary("turn-progress")
+            finally:
+                storage.close()
+
+        self.assertTrue(first)
+        self.assertFalse(duplicate)
+        self.assertEqual(2, len(events))
+        self.assertEqual(2, summary["eventCount"])
+        self.assertEqual("token_usage", summary["tokenUsageEvent"]["category"])
+        self.assertEqual(1, len(summary["warnings"]))
 
     def test_startup_recovery_resets_starting_without_turn_and_preserves_turn(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -837,6 +1043,7 @@ class McpDefinitionTests(unittest.TestCase):
                 "codex_interrupt_turn",
                 "codex_restart_app_server",
                 "codex_get_app_server_status",
+                "codex_get_runtime_capabilities",
                 "codex_health_summary",
                 "codex_collect_diagnostics",
                 "codex_get_diagnostic_logs",
@@ -867,15 +1074,15 @@ class McpDefinitionTests(unittest.TestCase):
         self.assertNotIn("return_events", start_schema)
         self.assertEqual(0, start_schema["first_message_timeout_seconds"]["default"])
         self.assertEqual(300, start_schema["timeout_seconds"]["default"])
-        self.assertEqual("never", start_schema["approval_policy"]["default"])
+        self.assertEqual("on-request", start_schema["approval_policy"]["default"])
         self.assertIn("ask_openclaw", start_schema["approval_policy"]["enum"])
         self.assertIn("plan", start_schema["collaboration_mode"]["enum"])
-        self.assertEqual("danger-full-access", start_schema["sandbox"]["default"])
+        self.assertEqual("read-only", start_schema["sandbox"]["default"])
 
-        self.assertEqual("never", send_schema["approval_policy"]["default"])
+        self.assertEqual("on-request", send_schema["approval_policy"]["default"])
         self.assertIn("ask_openclaw", send_schema["approval_policy"]["enum"])
         self.assertIn("plan", send_schema["collaboration_mode"]["enum"])
-        self.assertEqual("danger-full-access", send_schema["sandbox"]["default"])
+        self.assertEqual("read-only", send_schema["sandbox"]["default"])
 
         submit_schema = by_name["codex_submit_task"]["inputSchema"]
         self.assertEqual(["operation_type", "message"], submit_schema["required"])
@@ -885,20 +1092,24 @@ class McpDefinitionTests(unittest.TestCase):
         self.assertIn("steer_turn", submit_schema["properties"]["operation_type"]["enum"])
         self.assertIn("thread_id", submit_schema["properties"])
         self.assertIn("expected_turn_id", submit_schema["properties"])
-        self.assertEqual("danger-full-access", submit_schema["properties"]["sandbox"]["default"])
-        self.assertEqual("never", submit_schema["properties"]["approval_policy"]["default"])
+        self.assertEqual("read-only", submit_schema["properties"]["sandbox"]["default"])
+        self.assertEqual("on-request", submit_schema["properties"]["approval_policy"]["default"])
 
         operation_status_schema = by_name["codex_get_operation_status"]["inputSchema"]
         self.assertEqual(["operation_id"], operation_status_schema["required"])
         self.assertEqual(10, operation_status_schema["properties"]["last_messages"]["default"])
+        self.assertEqual(10, operation_status_schema["properties"]["progress_events"]["default"])
+        self.assertEqual(2000, operation_status_schema["properties"]["progress_max_chars"]["default"])
 
         turn_status_schema = by_name["codex_get_turn_status"]["inputSchema"]["properties"]
         self.assertEqual(10, turn_status_schema["last_messages"]["default"])
+        self.assertEqual(10, turn_status_schema["progress_events"]["default"])
+        self.assertEqual(2000, turn_status_schema["progress_max_chars"]["default"])
 
         workflow_schema = by_name["codex_start_plan_workflow"]["inputSchema"]["properties"]
         self.assertEqual(0, workflow_schema["first_message_timeout_seconds"]["default"])
-        self.assertEqual("danger-full-access", workflow_schema["sandbox"]["default"])
-        self.assertEqual("never", workflow_schema["approval_policy"]["default"])
+        self.assertEqual("read-only", workflow_schema["sandbox"]["default"])
+        self.assertEqual("on-request", workflow_schema["approval_policy"]["default"])
 
         workflow_status_schema = by_name["codex_get_workflow_status"]["inputSchema"]
         self.assertEqual(["workflow_id"], workflow_status_schema["required"])
@@ -906,12 +1117,16 @@ class McpDefinitionTests(unittest.TestCase):
         approve_plan_schema = by_name["codex_approve_plan"]["inputSchema"]
         self.assertEqual(["workflow_id"], approve_plan_schema["required"])
         self.assertEqual("Implement the plan.", approve_plan_schema["properties"]["message"]["default"])
+        self.assertEqual("read-only", approve_plan_schema["properties"]["sandbox"]["default"])
+        self.assertEqual("on-request", approve_plan_schema["properties"]["approval_policy"]["default"])
 
         execute_plan_schema = by_name["codex_execute_plan"]["inputSchema"]
         self.assertNotIn("required", execute_plan_schema)
         self.assertIn("workflow_id", execute_plan_schema["properties"])
         self.assertIn("chat_id", execute_plan_schema["properties"])
         self.assertEqual("Implement the plan.", execute_plan_schema["properties"]["message"]["default"])
+        self.assertEqual("read-only", execute_plan_schema["properties"]["sandbox"]["default"])
+        self.assertEqual("on-request", execute_plan_schema["properties"]["approval_policy"]["default"])
 
         pending_schema = by_name["codex_list_pending_interactions"]["inputSchema"]["properties"]
         self.assertEqual("pending", pending_schema["status"]["default"])
@@ -929,6 +1144,14 @@ class McpDefinitionTests(unittest.TestCase):
 
         restart_schema = by_name["codex_restart_app_server"]["inputSchema"]["properties"]
         self.assertIn("force", restart_schema)
+
+        runtime_schema = by_name["codex_get_runtime_capabilities"]["inputSchema"]["properties"]
+        self.assertFalse(runtime_schema["refresh"]["default"])
+        self.assertIsNone(runtime_schema["cwd"]["default"])
+        self.assertEqual(2, runtime_schema["timeout_seconds"]["default"])
+        self.assertTrue(runtime_schema["include_models"]["default"])
+        self.assertTrue(runtime_schema["include_hooks"]["default"])
+        self.assertTrue(runtime_schema["include_skills"]["default"])
 
         diagnostics_schema = by_name["codex_collect_diagnostics"]["inputSchema"]["properties"]
         self.assertIn("operation_id", diagnostics_schema)
@@ -978,6 +1201,108 @@ class McpDefinitionTests(unittest.TestCase):
         self.assertEqual(sorted(STABLE_OPENCLAW_TOOLS), version["stableTools"])
         self.assertEqual(sorted(COMPATIBILITY_TOOLS), version["compatibilityTools"])
         self.assertEqual(health["generatedAt"], version["generatedAt"])
+        self.assertEqual("not_collected", health["runtimeCapabilities"]["status"])
+
+    def test_runtime_capabilities_success_cache_refresh_and_health_subset(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = _search_service_config(root, root / ".codex" / "state_runtime.sqlite")
+            service = ToolService(config)
+            fake = FakeAppServer(service.storage)
+            service._app_server = fake  # type: ignore[assignment]
+            try:
+                first = asyncio.run(service.codex_get_runtime_capabilities({}))
+                first_call_count = len(fake.inventory_calls)
+                second = asyncio.run(service.codex_get_runtime_capabilities({}))
+                after_cache_count = len(fake.inventory_calls)
+                refreshed = asyncio.run(service.codex_get_runtime_capabilities({"refresh": True}))
+                after_refresh_count = len(fake.inventory_calls)
+                health = service.codex_health_summary({})
+                after_health_count = len(fake.inventory_calls)
+            finally:
+                asyncio.run(service.close())
+
+        self.assertTrue(first["ok"])
+        self.assertEqual("ok", first["runtimeCapabilities"]["status"])
+        self.assertFalse(first["cacheState"]["hit"])
+        self.assertEqual(6, first_call_count)
+        self.assertTrue(second["cacheState"]["hit"])
+        self.assertEqual(first_call_count, after_cache_count)
+        self.assertFalse(refreshed["cacheState"]["hit"])
+        self.assertEqual(first_call_count * 2, after_refresh_count)
+        self.assertEqual(after_refresh_count, after_health_count)
+
+        capabilities = first["runtimeCapabilities"]
+        self.assertEqual(2, capabilities["models"]["count"])
+        self.assertEqual("gpt-5", capabilities["models"]["defaultModel"])
+        self.assertEqual(2, capabilities["permissionProfiles"]["count"])
+        self.assertEqual("ready", capabilities["sandboxReadiness"]["status"])
+        self.assertEqual({"webSearch": True, "imageGeneration": False, "namespaceTools": True}, capabilities["modelProviderCapabilities"])
+        self.assertEqual(2, capabilities["hooks"]["hookCount"])
+        self.assertEqual(2, capabilities["skills"]["skillCount"])
+        self.assertEqual(82, capabilities["schemaMethods"]["methodCount"])
+        self.assertIn("turn/steer", capabilities["schemaMethods"]["methods"])
+
+        rendered = json.dumps(first, ensure_ascii=False)
+        self.assertNotIn("run-hook.ps1", rendered)
+        self.assertNotIn("stop.ps1", rendered)
+        self.assertNotIn("SKILL.md", rendered)
+        self.assertNotIn("C:\\Secret", rendered)
+        self.assertNotIn("D:\\private", rendered)
+        self.assertNotIn("sk-secret", rendered)
+
+        runtime_health = health["runtimeCapabilities"]
+        self.assertEqual("ok", runtime_health["status"])
+        self.assertEqual(2, runtime_health["modelCount"])
+        self.assertEqual("gpt-5", runtime_health["defaultModel"])
+        self.assertEqual("ready", runtime_health["sandboxReadiness"])
+        self.assertEqual(0, runtime_health["warningsCount"])
+
+    def test_runtime_capabilities_method_timeout_is_partial_ok(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = _search_service_config(root, root / ".codex" / "state_runtime_timeout.sqlite")
+            service = ToolService(config)
+            fake = FakeAppServer(service.storage)
+            fake.inventory_failures["model/list"] = CodexMcpError("CODEX_TIMEOUT", "inventory timed out", retryable=True)
+            service._app_server = fake  # type: ignore[assignment]
+            try:
+                result = asyncio.run(service.codex_get_runtime_capabilities({}))
+            finally:
+                asyncio.run(service.close())
+
+        self.assertTrue(result["ok"])
+        self.assertEqual("partial", result["runtimeCapabilities"]["status"])
+        self.assertIsNone(result["runtimeCapabilities"]["models"])
+        self.assertEqual("timeout", result["methodResults"]["model/list"]["status"])
+        self.assertEqual("CODEX_TIMEOUT", result["methodResults"]["model/list"]["errorCode"])
+        self.assertEqual(1, len(result["warnings"]))
+        self.assertEqual("model/list", result["warnings"][0]["method"])
+        self.assertEqual("ok", result["methodResults"]["permissionProfile/list"]["status"])
+
+    def test_runtime_capabilities_include_flags_skip_optional_methods(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = _search_service_config(root, root / ".codex" / "state_runtime_skip.sqlite")
+            service = ToolService(config)
+            fake = FakeAppServer(service.storage)
+            service._app_server = fake  # type: ignore[assignment]
+            try:
+                result = asyncio.run(
+                    service.codex_get_runtime_capabilities(
+                        {"include_models": False, "include_hooks": False, "include_skills": False}
+                    )
+                )
+            finally:
+                asyncio.run(service.close())
+
+        self.assertTrue(result["ok"])
+        self.assertEqual("skipped", result["methodResults"]["model/list"]["status"])
+        self.assertEqual("skipped", result["methodResults"]["hooks/list"]["status"])
+        self.assertEqual("skipped", result["methodResults"]["skills/list"]["status"])
+        self.assertNotIn("model/list", fake.inventory_calls)
+        self.assertNotIn("hooks/list", fake.inventory_calls)
+        self.assertNotIn("skills/list", fake.inventory_calls)
 
     def test_pending_interaction_response_builders(self) -> None:
         self.assertEqual(
@@ -1264,6 +1589,21 @@ class McpDefinitionTests(unittest.TestCase):
             os.environ["OPENCLAW_CODEX_MCP_LOG"] = str(log_path)
             service = ToolService(config)
             try:
+                tracker = TurnTracker(service.storage)
+                tracker.register_turn(
+                    turn_id="turn-d",
+                    thread_id="thread-d",
+                    chat_id="thread-d",
+                    project_id="project-d",
+                    project_path=str(root),
+                )
+                tracker.record_event(
+                    {
+                        "method": "warning",
+                        "params": {"threadId": "thread-d", "message": "warning token=secret-value"},
+                    },
+                    received_at="2026-05-25T00:00:01+00:00",
+                )
                 service.storage.record_app_server_event(
                     "inbound",
                     {
@@ -1288,6 +1628,11 @@ class McpDefinitionTests(unittest.TestCase):
         self.assertTrue(any(item["name"] == "codex_binary" for item in diagnostics["checks"]))
         serialized = json.dumps(logs, ensure_ascii=False)
         self.assertNotIn("secret-value", serialized)
+        diagnostics_serialized = json.dumps(diagnostics, ensure_ascii=False)
+        self.assertNotIn("secret-value", diagnostics_serialized)
+        self.assertTrue(any(item["source"] == "turn_progress" for item in diagnostics["timeline"]))
+        self.assertEqual(1, diagnostics["progressJournal"]["eventCount"])
+        self.assertEqual(1, len(diagnostics["progressJournal"]["warnings"]))
         self.assertEqual(1, logs["returnedEventCount"])
 
     def test_health_summary_and_operation_diagnostics_correlation(self) -> None:
@@ -1660,6 +2005,135 @@ class McpDefinitionTests(unittest.TestCase):
         self.assertEqual("completed", live["latestPlan"]["status"])
         self.assertEqual("Snapshot plan", snapshot["latestPlan"]["markdown"])
         self.assertEqual("completed", snapshot["status"])
+
+    def test_turn_tracker_records_redacted_progress_events_without_raw_diff(self) -> None:
+        with TemporaryDirectory() as tmp:
+            storage = McpStorage(Path(tmp) / "state.sqlite3")
+            storage.connect()
+            try:
+                tracker = TurnTracker(storage)
+                tracker.register_turn(
+                    turn_id="turn-progress",
+                    thread_id="thread-progress",
+                    chat_id="thread-progress",
+                    project_id="project-1",
+                    project_path=str(Path(tmp)),
+                )
+                delta_payload = {
+                    "method": "item/agentMessage/delta",
+                    "params": {
+                        "threadId": "thread-progress",
+                        "turnId": "turn-progress",
+                        "itemId": "agent-1",
+                        "delta": "Working with token=secret-value",
+                    },
+                }
+                tracker.record_event(delta_payload, received_at="2026-05-25T00:00:01+00:00")
+                tracker.record_event(delta_payload, received_at="2026-05-25T00:00:01+00:00")
+                tracker.record_event(
+                    {
+                        "method": "item/reasoning/summaryTextDelta",
+                        "params": {
+                            "threadId": "thread-progress",
+                            "turnId": "turn-progress",
+                            "itemId": "reasoning-1",
+                            "summaryIndex": 0,
+                            "delta": "Checking visible summary",
+                        },
+                    },
+                    received_at="2026-05-25T00:00:02+00:00",
+                )
+                tracker.record_event(
+                    {
+                        "method": "turn/diff/updated",
+                        "params": {
+                            "threadId": "thread-progress",
+                            "turnId": "turn-progress",
+                            "diff": "diff --git a/file b/file\n+++ b/file\n+very-sensitive-diff-line\n-removed-secret-line",
+                        },
+                    },
+                    received_at="2026-05-25T00:00:03+00:00",
+                )
+                tracker.record_event(
+                    {
+                        "method": "thread/tokenUsage/updated",
+                        "params": {
+                            "threadId": "thread-progress",
+                            "turnId": "turn-progress",
+                            "tokenUsage": {
+                                "last": {
+                                    "cachedInputTokens": 1,
+                                    "inputTokens": 2,
+                                    "outputTokens": 3,
+                                    "reasoningOutputTokens": 4,
+                                    "totalTokens": 10,
+                                },
+                                "total": {
+                                    "cachedInputTokens": 1,
+                                    "inputTokens": 2,
+                                    "outputTokens": 3,
+                                    "reasoningOutputTokens": 4,
+                                    "totalTokens": 10,
+                                },
+                                "modelContextWindow": 128000,
+                            },
+                        },
+                    },
+                    received_at="2026-05-25T00:00:04+00:00",
+                )
+                tracker.record_event(
+                    {
+                        "method": "model/rerouted",
+                        "params": {
+                            "threadId": "thread-progress",
+                            "turnId": "turn-progress",
+                            "fromModel": "gpt-5",
+                            "toModel": "gpt-5-safe",
+                            "reason": "highRiskCyberActivity",
+                        },
+                    },
+                    received_at="2026-05-25T00:00:05+00:00",
+                )
+                tracker.record_event(
+                    {
+                        "method": "guardianWarning",
+                        "params": {
+                            "threadId": "thread-progress",
+                            "message": "Guardian warning api_key=SECRETSECRET",
+                        },
+                    },
+                    received_at="2026-05-25T00:00:06+00:00",
+                )
+                status = tracker.get_turn_status(
+                    "turn-progress",
+                    last_messages=10,
+                    message_max_chars=8000,
+                    progress_events=10,
+                    progress_max_chars=2000,
+                )
+                disabled = tracker.get_turn_status(
+                    "turn-progress",
+                    last_messages=10,
+                    message_max_chars=8000,
+                    progress_events=0,
+                )
+            finally:
+                storage.close()
+
+        self.assertIsNotNone(status)
+        self.assertEqual(6, status["progressEventCount"])
+        categories = [item["category"] for item in status["progressEvents"]]
+        self.assertIn("agent_message_delta", categories)
+        self.assertIn("reasoning_summary", categories)
+        self.assertIn("diff_updated", categories)
+        self.assertEqual(10, status["tokenUsage"]["total"]["totalTokens"])
+        self.assertEqual("gpt-5-safe", status["modelReroutes"][0]["toModel"])
+        serialized = json.dumps(status, ensure_ascii=False)
+        self.assertIn("token=[redacted]", serialized)
+        self.assertIn("api_key=[redacted]", serialized)
+        self.assertNotIn("very-sensitive-diff-line", serialized)
+        self.assertNotIn("removed-secret-line", serialized)
+        self.assertNotIn("progressEvents", disabled)
 
     def test_get_turn_status_reads_live_storage(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -2323,6 +2797,33 @@ class McpDefinitionTests(unittest.TestCase):
                     )
                     fake.tracker.record_event(
                         {
+                            "method": "thread/tokenUsage/updated",
+                            "params": {
+                                "threadId": accepted["threadId"],
+                                "turnId": accepted["turnId"],
+                                "tokenUsage": {
+                                    "last": {
+                                        "cachedInputTokens": 0,
+                                        "inputTokens": 1,
+                                        "outputTokens": 2,
+                                        "reasoningOutputTokens": 3,
+                                        "totalTokens": 6,
+                                    },
+                                    "total": {
+                                        "cachedInputTokens": 0,
+                                        "inputTokens": 1,
+                                        "outputTokens": 2,
+                                        "reasoningOutputTokens": 3,
+                                        "totalTokens": 6,
+                                    },
+                                    "modelContextWindow": 128000,
+                                },
+                            },
+                        },
+                        received_at="2026-05-25T00:00:01+00:00",
+                    )
+                    fake.tracker.record_event(
+                        {
                             "method": "turn/completed",
                             "params": {
                                 "threadId": accepted["threadId"],
@@ -2353,6 +2854,8 @@ class McpDefinitionTests(unittest.TestCase):
         self.assertTrue(repeated["idempotent"])
         self.assertEqual(submitted["operationId"], repeated["operationId"])
         self.assertEqual(1, len(calls))
+        self.assertEqual(6, completed["tokenUsage"]["total"]["totalTokens"])
+        self.assertTrue(any(item["category"] == "token_usage" for item in completed["progressEvents"]))
         self.assertEqual("completed", completed["status"])
         self.assertEqual("completed", completed["phase"])
         self.assertFalse(completed["pollRecommended"])

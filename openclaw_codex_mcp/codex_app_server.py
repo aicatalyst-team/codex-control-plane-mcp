@@ -45,6 +45,7 @@ class CodexAppServerClient:
         self.process_generation = 0
         self.started_at: str | None = None
         self.last_error: str | None = None
+        self.initialize_result: dict[str, Any] | None = None
 
     async def start(self) -> None:
         if self.process is not None and self.process.returncode is None:
@@ -66,7 +67,7 @@ class CodexAppServerClient:
         LOG.info("codex app-server process started pid=%s generation=%s", self.process.pid, self.process_generation)
         self._stdout_task = asyncio.create_task(self._read_stdout_loop(), name="codex-app-server-stdout")
         self._stderr_task = asyncio.create_task(self._read_stderr_loop(), name="codex-app-server-stderr")
-        await self.request(
+        initialize_result = await self.request(
             "initialize",
             {
                 "protocolVersion": "2025-01-10",
@@ -75,6 +76,7 @@ class CodexAppServerClient:
             },
             timeout_seconds=30,
         )
+        self.initialize_result = initialize_result if isinstance(initialize_result, dict) else {"result": initialize_result}
         await self.notify("initialized", {})
         LOG.info("codex app-server initialized pid=%s generation=%s", self.process.pid, self.process_generation)
 
@@ -180,7 +182,7 @@ class CodexAppServerClient:
             snapshot["recentEvents"] = list(self._recent_events)[-20:]
         return snapshot
 
-    async def request(self, method: str, params: dict[str, Any], timeout_seconds: float | None = None) -> Any:
+    async def request(self, method: str, params: dict[str, Any] | None, timeout_seconds: float | None = None) -> Any:
         await self._ensure_running()
         self._request_id += 1
         request_id = self._request_id
@@ -322,6 +324,56 @@ class CodexAppServerClient:
         if client_user_message_id:
             params["clientUserMessageId"] = client_user_message_id
         result = await self.request("turn/steer", params, timeout_seconds=timeout_seconds)
+        return result if isinstance(result, dict) else {"result": result}
+
+    async def model_list(
+        self,
+        *,
+        limit: int | None = 100,
+        include_hidden: bool | None = False,
+        cursor: str | None = None,
+        timeout_seconds: float | None = 2,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {"limit": limit, "includeHidden": include_hidden}
+        if cursor:
+            params["cursor"] = cursor
+        result = await self.request("model/list", params, timeout_seconds=timeout_seconds)
+        return result if isinstance(result, dict) else {"data": result}
+
+    async def permission_profile_list(
+        self,
+        *,
+        cwd: str | None = None,
+        limit: int | None = 100,
+        cursor: str | None = None,
+        timeout_seconds: float | None = 2,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {"limit": limit}
+        if cwd:
+            params["cwd"] = cwd
+        if cursor:
+            params["cursor"] = cursor
+        result = await self.request("permissionProfile/list", params, timeout_seconds=timeout_seconds)
+        return result if isinstance(result, dict) else {"data": result}
+
+    async def windows_sandbox_readiness(self, *, timeout_seconds: float | None = 2) -> dict[str, Any]:
+        result = await self.request("windowsSandbox/readiness", None, timeout_seconds=timeout_seconds)
+        return result if isinstance(result, dict) else {"status": result}
+
+    async def hooks_list(self, *, cwds: list[str], timeout_seconds: float | None = 2) -> dict[str, Any]:
+        result = await self.request("hooks/list", {"cwds": cwds}, timeout_seconds=timeout_seconds)
+        return result if isinstance(result, dict) else {"data": result}
+
+    async def skills_list(self, *, cwds: list[str], force_reload: bool = False, timeout_seconds: float | None = 2) -> dict[str, Any]:
+        result = await self.request(
+            "skills/list",
+            {"cwds": cwds, "forceReload": force_reload},
+            timeout_seconds=timeout_seconds,
+        )
+        return result if isinstance(result, dict) else {"data": result}
+
+    async def model_provider_capabilities_read(self, *, timeout_seconds: float | None = 2) -> dict[str, Any]:
+        result = await self.request("modelProvider/capabilities/read", {}, timeout_seconds=timeout_seconds)
         return result if isinstance(result, dict) else {"result": result}
 
     async def _ensure_running(self) -> None:

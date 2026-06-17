@@ -30,8 +30,8 @@ class ServerConfig:
     codex_binary_path: Path = DEFAULT_REAL_CODEX
     state_db_path: Path = Path("state/codex-mcp-state.sqlite3")
     allowed_roots: list[Path] = field(default_factory=lambda: [DEFAULT_PROJECTS_ROOT])
-    default_approval_policy: str = "never"
-    default_sandbox_policy: dict = field(default_factory=lambda: {"type": "dangerFullAccess"})
+    default_approval_policy: str = "on-request"
+    default_sandbox_policy: dict = field(default_factory=lambda: {"type": "readOnly"})
     default_model: str = "gpt-5.5"
     default_effort: str = "xhigh"
     default_summary: str = "auto"
@@ -96,13 +96,13 @@ class ServerConfig:
             default_approval_policy=_approval_policy_value(
                 os.environ.get("CODEX_MCP_DEFAULT_APPROVAL_POLICY")
                 or payload.get("default_approval_policy"),
-                "never",
+                "on-request",
             ),
             default_sandbox_policy=_sandbox_policy_value(
                 os.environ.get("CODEX_MCP_DEFAULT_SANDBOX")
                 or os.environ.get("CODEX_MCP_DEFAULT_SANDBOX_POLICY")
                 or payload.get("default_sandbox_policy"),
-                {"type": "dangerFullAccess"},
+                {"type": "readOnly"},
             ),
             default_model=str(os.environ.get("CODEX_MCP_DEFAULT_MODEL") or payload.get("default_model") or "gpt-5.5"),
             default_effort=str(os.environ.get("CODEX_MCP_DEFAULT_EFFORT") or payload.get("default_effort") or "xhigh"),
