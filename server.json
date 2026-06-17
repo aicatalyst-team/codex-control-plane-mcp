@@ -1,0 +1,23 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.aresyn/codex-control-plane-mcp",
+  "title": "Codex Control Plane MCP",
+  "description": "Durable MCP control plane for long-running Codex Desktop tasks.",
+  "version": "0.1.2",
+  "websiteUrl": "https://github.com/aresyn/codex-control-plane-mcp",
+  "repository": {
+    "url": "https://github.com/aresyn/codex-control-plane-mcp",
+    "source": "github",
+    "id": "1272121729"
+  },
+  "packages": [
+    {
+      "registryType": "pypi",
+      "identifier": "codex-control-plane-mcp",
+      "version": "0.1.2",
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ]
+}
