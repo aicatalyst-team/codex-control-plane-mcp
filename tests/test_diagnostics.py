@@ -90,6 +90,26 @@ class McpDefinitionTests(unittest.TestCase):
         self.assertEqual("app_server_stdout_closed", analysis["likelyRootCause"]["category"])
         self.assertIn("restart_app_server_idle", [item["action"] for item in analysis["recommendedRepairActions"]])
 
+        auth_analysis = analyze_context(
+            "unexpected status 401 Unauthorized: Missing bearer or basic authentication in header",
+            {"checks": [], "activeWork": {"activeTurns": [], "pendingInteractions": 0}},
+            {
+                "logs": [],
+                "events": [
+                    {
+                        "method": "turn/completed",
+                        "payload": {
+                            "error": {
+                                "message": "unexpected status 401 Unauthorized: Missing bearer or basic authentication in header"
+                            }
+                        },
+                    }
+                ],
+            },
+        )
+        self.assertEqual("codex_auth_required", auth_analysis["likelyRootCause"]["category"])
+        self.assertIn("reauthenticate_codex_home", [item["action"] for item in auth_analysis["recommendedRepairActions"]])
+
         operation_analysis = analyze_context(
             "CODEX_DUPLICATE_PROMPT_ACTIVE and stale operation",
             {

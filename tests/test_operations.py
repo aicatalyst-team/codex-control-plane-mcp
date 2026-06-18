@@ -219,6 +219,47 @@ class McpDefinitionTests(unittest.TestCase):
         self.assertIsNotNone(hook_turn)
         self.assertIsNone(hook_turn["last_error"])
 
+    def test_turn_tracker_records_nested_terminal_error_from_turn_completed(self) -> None:
+        with TemporaryDirectory() as tmp:
+            storage = McpStorage(Path(tmp) / "state.sqlite3")
+            storage.connect()
+            try:
+                tracker = TurnTracker(storage)
+                tracker.register_turn(
+                    turn_id="turn-auth",
+                    thread_id="thread-auth",
+                    chat_id="thread-auth",
+                    project_id="project-1",
+                    project_path=str(Path(tmp)),
+                )
+                tracker.record_event(
+                    {
+                        "method": "turn/completed",
+                        "params": {
+                            "threadId": "thread-auth",
+                            "turn": {
+                                "id": "turn-auth",
+                                "status": "failed",
+                                "error": {
+                                    "message": "unexpected status 401 Unauthorized: Missing bearer or basic authentication in header"
+                                },
+                            },
+                        },
+                    },
+                    received_at="2026-05-25T00:00:02+00:00",
+                )
+                status = tracker.get_turn_status("turn-auth", last_messages=10, message_max_chars=8000)
+                hook_turn = storage.get_hook_turn("turn-auth")
+            finally:
+                storage.close()
+
+        self.assertIsNotNone(status)
+        self.assertEqual("failed", status["status"])
+        self.assertTrue(status["terminalEvidence"]["trusted"])
+        self.assertIn("401 Unauthorized", status["lastError"])
+        self.assertIsNotNone(hook_turn)
+        self.assertIn("401 Unauthorized", hook_turn["last_error"])
+
     def test_turn_tracker_records_plan_deltas_completed_item_and_snapshot(self) -> None:
         with TemporaryDirectory() as tmp:
             storage = McpStorage(Path(tmp) / "state.sqlite3")

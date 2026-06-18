@@ -798,6 +798,15 @@ def _terminal_evidence(turn: dict[str, Any], status: str) -> dict[str, Any]:
 
 def _event_error(payload: dict[str, Any]) -> str | None:
     params = _payload_params(payload)
+    turn = params.get("turn")
+    if isinstance(turn, dict):
+        value = turn.get("error")
+        if isinstance(value, str) and value:
+            return value
+        if isinstance(value, dict):
+            nested = value.get("message")
+            if isinstance(nested, str) and nested:
+                return nested
     for key in ("error", "message", "reason"):
         value = params.get(key)
         if isinstance(value, str) and value:

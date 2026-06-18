@@ -170,6 +170,15 @@ def action(
 
 
 def actions_for_category(category: str) -> list[dict[str, Any]]:
+    if category == "codex_auth_required":
+        return [
+            action(
+                "reauthenticate_codex_home",
+                safe_to_run=False,
+                expected_effect="Run Codex login or provision auth.json for the configured CODEX_HOME, then retry the failed turn.",
+                risk="medium",
+            )
+        ]
     if category in {"app_server_not_running", "app_server_unavailable"}:
         return [action("restart_app_server_idle", expected_effect="Start or restart the MCP-owned Codex app-server when idle.")]
     if category in {"app_server_stdout_closed", "broken_pipe", "app_server_exited"}:
@@ -235,6 +244,21 @@ def analyze_context(problem_text: str | None, diagnostics: dict[str, Any], logs:
                 "error" if status == "error" else "warning",
                 str(item.get("message") or item.get("name") or category),
                 evidence=[item],
+                confidence="high",
+            )
+        )
+
+    if _auth_error_in_text(haystack):
+        findings.append(
+            finding(
+                "codex_auth_required",
+                "error",
+                "Codex app-server could not authenticate to the OpenAI API.",
+                evidence=_matching_evidence(
+                    log_entries,
+                    event_entries,
+                    ("401 unauthorized", "missing bearer", "missing basic authentication", "requiresopenaiauth"),
+                ),
                 confidence="high",
             )
         )
@@ -413,6 +437,8 @@ def likely_root_cause(findings: list[dict[str, Any]]) -> dict[str, Any]:
 def next_steps_for_findings(findings: list[dict[str, Any]]) -> list[str]:
     categories = {str(item.get("category")) for item in findings}
     steps: list[str] = []
+    if "codex_auth_required" in categories:
+        steps.append("Verify the configured CODEX_HOME has Codex authentication, for example auth.json or an equivalent login.")
     if categories & {"app_server_stdout_closed", "app_server_not_running", "app_server_exited"}:
         steps.append("Inspect recent MCP log lines and app_server_events around the last processGeneration.")
     if categories & {"stale_turn", "stale_operation"}:
@@ -513,6 +539,14 @@ def _matching_evidence(logs: list[dict[str, Any]], events: list[dict[str, Any]],
         if any(marker in text for marker in markers):
             evidence.append(entry)
     return evidence[:10]
+
+
+def _auth_error_in_text(text: str) -> bool:
+    return (
+        ("401 unauthorized" in text and ("missing bearer" in text or "basic authentication" in text))
+        or "requiresopenaiauth" in text
+        or "codex auth required" in text
+    )
 
 
 def _deduplicate_findings(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:

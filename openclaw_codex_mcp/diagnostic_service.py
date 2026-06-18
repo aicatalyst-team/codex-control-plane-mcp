@@ -822,6 +822,24 @@ class DiagnosticServiceMixin:
                     suggested_action="validate_paths_and_config",
                 )
             )
+        has_auth_file = (self.config.codex_home / "auth.json").exists()
+        has_auth_env = bool(os.environ.get("OPENAI_API_KEY") or os.environ.get("CODEX_API_KEY"))
+        checks.append(
+            diagnostic_check(
+                "codex_auth",
+                "ok" if has_auth_file or has_auth_env else "warning",
+                "Codex authentication is available for this CODEX_HOME."
+                if has_auth_file or has_auth_env
+                else "No Codex auth.json or API-key environment was found for this CODEX_HOME.",
+                details={
+                    "category": "codex_auth_required",
+                    "codexHome": str(self.config.codex_home),
+                    "authJsonPresent": has_auth_file,
+                    "apiKeyEnvPresent": has_auth_env,
+                },
+                suggested_action="reauthenticate_codex_home",
+            )
+        )
         missing_roots = [str(root) for root in self.config.allowed_roots if not root.exists()]
         checks.append(
             diagnostic_check(
