@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import time
 from asyncio.subprocess import Process
 from collections import deque
@@ -55,7 +56,14 @@ class CodexAppServerClient:
         self.process_generation += 1
         self.started_at = _now_iso()
         self.last_error = None
-        LOG.info("starting codex app-server binary=%s cwd=%s", self.config.codex_binary_path, self.config.projects_root)
+        env = os.environ.copy()
+        env["CODEX_HOME"] = str(self.config.codex_home)
+        LOG.info(
+            "starting codex app-server binary=%s cwd=%s codex_home=%s",
+            self.config.codex_binary_path,
+            self.config.projects_root,
+            self.config.codex_home,
+        )
         self.process = await asyncio.create_subprocess_exec(
             str(self.config.codex_binary_path),
             "app-server",
@@ -63,6 +71,7 @@ class CodexAppServerClient:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=str(self.config.projects_root),
+            env=env,
         )
         LOG.info("codex app-server process started pid=%s generation=%s", self.process.pid, self.process_generation)
         self._stdout_task = asyncio.create_task(self._read_stdout_loop(), name="codex-app-server-stdout")
@@ -177,6 +186,7 @@ class CodexAppServerClient:
             "lastError": self.last_error,
             "codexBinaryPath": str(self.config.codex_binary_path),
             "codexBinaryExists": self.config.codex_binary_path.exists(),
+            "codexHome": str(self.config.codex_home),
         }
         if include_recent_events:
             snapshot["recentEvents"] = list(self._recent_events)[-20:]
