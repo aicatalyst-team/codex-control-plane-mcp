@@ -214,7 +214,7 @@ class TurnTracker:
             turn_id = str(raw_turn.get("id") or raw_turn.get("turnId") or "")
             if not turn_id:
                 continue
-            status = _normalize_status(str(raw_turn.get("status") or "unknown"))
+            status = _normalize_status(raw_turn.get("status") or "unknown")
             current = self.storage.get_tracked_turn(turn_id)
             self.storage.upsert_tracked_turn(
                 {
@@ -313,8 +313,9 @@ class TurnTracker:
             for message in self.storage.get_last_tracked_turn_messages(turn_id, last_messages)
         ]
         message_count = self.storage.count_tracked_turn_messages(turn_id)
-        completion_observed = turn["status"] in COMPLETION_OBSERVED_STATUSES
         final_message = _truncate(turn.get("final_message"), message_max_chars)
+        status = _status_with_final_message(turn["status"], final_message)
+        completion_observed = status in COMPLETION_OBSERVED_STATUSES
         last_error = _visible_last_error(turn)
         pending_interactions = [
             interaction_row_to_tool(row)
@@ -332,7 +333,7 @@ class TurnTracker:
             "chatId": turn.get("chat_id"),
             "project_id": turn.get("project_id"),
             "projectId": turn.get("project_id"),
-            "status": turn["status"],
+            "status": status,
             "completion_observed": completion_observed,
             "completionObserved": completion_observed,
             "started_at": turn.get("started_at"),
@@ -467,7 +468,7 @@ class TurnTracker:
                         "item_id": str(item.get("id") or params.get("itemId") or f"{turn_id}-plan"),
                         "turn_id": turn_id,
                         "thread_id": thread_id,
-                        "status": _normalize_status(str(params.get("status") or item.get("status") or "in_progress")),
+                        "status": _normalize_status(params.get("status") or item.get("status") or "in_progress"),
                         "text": text,
                         "created_at": received_at,
                         "updated_at": received_at,
@@ -728,7 +729,7 @@ def _event_status(payload: dict[str, Any]) -> str | None:
     if status is None and isinstance(turn, dict):
         status = turn.get("status")
     if method == "turn/completed":
-        return _normalize_status(str(status or "completed"))
+        return _normalize_status(status or "completed")
     if method in {"turn/aborted", "turn/cancelled", "turn/canceled"}:
         return "aborted"
     if method == "turn/error":
@@ -740,13 +741,15 @@ def _event_status(payload: dict[str, Any]) -> str | None:
     if method in {"turn/started", "turn/start"}:
         return "running"
     if status:
-        return _normalize_status(str(status))
+        return _normalize_status(status)
     return None
 
 
-def _normalize_status(value: str) -> str:
-    normalized = value.strip().lower()
-    if normalized in {"complete", "completed", "done"}:
+def _normalize_status(value: Any) -> str:
+    if isinstance(value, dict):
+        value = value.get("type") or value.get("status") or value.get("state") or "unknown"
+    normalized = str(value or "").strip().lower()
+    if normalized in {"idle", "complete", "completed", "done"}:
         return "completed"
     if normalized in {"in_progress", "running", "started"}:
         return "running"
@@ -761,6 +764,13 @@ def _normalize_status(value: str) -> str:
     if normalized == "aborted":
         return "aborted"
     return normalized or "unknown"
+
+
+def _status_with_final_message(status: Any, final_message: str | None) -> str:
+    normalized = _normalize_status(status)
+    if normalized == "ready" and isinstance(final_message, str) and final_message.strip():
+        return "completed"
+    return normalized
 
 
 def _event_error(payload: dict[str, Any]) -> str | None:

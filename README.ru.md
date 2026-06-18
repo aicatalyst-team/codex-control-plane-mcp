@@ -1,3 +1,5 @@
+[![MseeP.ai Security Assessment Badge](https://mseep.net/pr/aresyn-codex-control-plane-mcp-badge.png)](https://mseep.ai/app/aresyn-codex-control-plane-mcp)
+
 # Codex Control Plane MCP
 
 [English](README.md) | Русский
@@ -55,6 +57,9 @@ MCP client / orchestrator
 | Восстановление после restart | ad hoc | persisted operation state |
 | Диагностика | только logs | health, diagnostics, repair tools |
 
+Более подробное сравнение с тонкими wrappers есть в
+[docs/THIN_WRAPPERS.md](docs/THIN_WRAPPERS.md).
+
 ## Текущая поддержка
 
 - Полный live target: Windows с Codex Desktop и `codex-app-server`.
@@ -81,10 +86,16 @@ MCP client / orchestrator
 - SQLite leases и heartbeats для конкурирующих MCP-процессов.
 - Восстановление после рестарта MCP во время `thread/start` или `turn/start`.
 - Durable `turn/steer`, чтобы добавить контекст в активный turn без второго turn.
+- Durable `thread/fork`, чтобы ответвить существующий thread, с первым сообщением или без него.
 - Plan Mode workflows: план, polling, approve, execution, финальный отчет.
+- Code review workflows через app-server `review/start`, polling и сохранение итогового отчета.
+- Structured final reports через `output_schema`.
+- Thread lifecycle tools для archive, unarchive и pollable compaction.
+- Workflow goal sync с Codex Desktop thread goals.
+- Image и local image inputs для turns, которые стартуют через `turn/start`.
 - Pending approvals и вопросы как pollable MCP state.
 - Interrupt turns по `threadId`/`turnId`, `operationId` или `workflowId`.
-- Runtime inventory: модели, permission profiles, sandbox readiness, hooks, skills, provider features и поддерживаемые app-server methods.
+- Runtime inventory: модели, permission profiles, sandbox readiness, hooks, skills, provider features, account status, usage bands, rate-limit state и поддерживаемые app-server methods.
 - Health checks, diagnostics, issue analysis и dry-run repairs.
 - Собственная hook history в SQLite для поиска, summaries и fallback reads.
 - Журнал progress events из app-server: deltas, warnings, model reroutes и token usage.
@@ -206,6 +217,26 @@ codex_get_operation_status(operationId)
 transport timeout. Retry вернет существующую operation, а не создаст еще один
 turn.
 
+Передать скриншот или другое image evidence:
+
+```text
+codex_submit_task(
+  operation_type="start_chat",
+  message="Analyze this screen.",
+  input_items=[
+    {"type": "localImage", "path": ".\\screens\\error.png", "detail": "low"},
+    {"type": "image", "url": "https://example.com/screenshot.png", "detail": "high"}
+  ]
+)
+```
+
+Image inputs работают только для operation types, которые стартуют новый turn:
+`start_chat`, `send_message`, `execute_plan` и `fork_thread` с initial message.
+MCP передает path или URL в `codex-app-server`, но в operation status и
+diagnostics возвращает только безопасные metadata: type, detail, size,
+extension и hashes. Binary image content, raw URLs и полные локальные image
+paths не сохраняются в публичных status payloads.
+
 Steer активного turn:
 
 ```text
@@ -217,6 +248,69 @@ codex_get_operation_status(operationId)
 
 Используйте `steer_turn` только пока target turn активен. Для завершенного
 thread нужен обычный `send_message`.
+
+Fork thread:
+
+```text
+codex_submit_task(operation_type="fork_thread", source_thread_id=...)
+  -> operationId
+codex_get_operation_status(operationId)
+  -> completed, threadId=<forkedThreadId>
+```
+
+Сразу начать работу в fork:
+
+```text
+codex_submit_task(operation_type="fork_thread", source_thread_id=..., message=...)
+  -> operationId
+codex_get_operation_status(operationId)
+  -> следует за первым turn в forked thread
+```
+
+Передавайте `client_request_id`, если fork request может быть повторен после
+transport timeout. Без него каждый вызов считается новым fork request. `threadId`
+в operation status означает forked thread; исходный thread лежит в
+`forkState.sourceThreadId`.
+
+Управление жизненным циклом thread:
+
+```text
+codex_archive_thread(thread_id)
+  -> completed
+codex_unarchive_thread(thread_id)
+  -> completed
+codex_start_thread_compaction(thread_id)
+  -> actionId
+codex_get_thread_compaction_status(actionId)
+  -> running / completed / unknown_after_app_server_exit
+```
+
+Archive и unarchive работают как audit actions вокруг app-server
+`thread/archive` и `thread/unarchive`. Они не запускаются, если в thread есть
+активный turn или pending interaction. Compaction получает отдельный легкий
+`actionId`, потому что `thread/compact/start` асинхронный. Public
+`thread/delete` намеренно не открыт.
+
+Запросить структурированный итоговый отчет:
+
+```text
+codex_submit_task(operation_type="start_chat", message=..., output_schema={...})
+codex_approve_plan(workflowId, output_schema={...})
+  -> operationId / executionOperationId
+codex_get_operation_status(operationId)
+codex_get_workflow_status(workflowId)
+  -> finalReport.text + finalReport.structured
+```
+
+`output_schema` передается в app-server `turn/start`, а в status output хранится
+hash этой schema. Object schema должна быть в strict-формате, который требует
+Codex: `additionalProperties` должен быть `false`. MCP сохраняет финальное
+assistant message как читаемый текст и парсит JSON object в
+`finalReport.structured`, если Codex вернул валидный JSON. Обычный текстовый
+ответ тоже остается рабочим и доступен в `finalReport.text`.
+
+MCP не извлекает скрытый chain-of-thought и не сохраняет raw tool payloads или
+command output в итоговых отчетах.
 
 Plan Mode:
 
@@ -230,6 +324,40 @@ codex_approve_plan(workflowId)
 codex_get_workflow_status(workflowId)
   -> finalReport
 ```
+
+Передать цель workflow в Codex Desktop, если клиент явно ее задал:
+
+```text
+codex_start_plan_workflow(goal="Review the migration plan", goal_completion_action="clear")
+codex_get_workflow_status(workflowId)
+  -> threadGoal.syncState + threadGoal.currentGoal
+```
+
+MCP пишет цель thread только когда клиент передал `goal`. Для управляемых целей
+после completion по умолчанию используется `clear`. Если цель должна остаться
+видимой после завершения workflow, можно выбрать `set_complete` или `leave`.
+
+Запустить Codex code review:
+
+```text
+codex_start_review_workflow(thread_id=..., target_type="base_branch", base_branch="main")
+  -> workflowId
+codex_get_workflow_status(workflowId)
+  -> wait_review / read_review_report
+```
+
+Или дать MCP создать служебный thread для локального checkout:
+
+```text
+codex_start_review_workflow(cwd=..., target_type="uncommitted_changes")
+  -> workflowId
+codex_get_workflow_status(workflowId)
+  -> reviewThreadId + reviewTurnId + finalReport
+```
+
+Review workflow сам по себе не меняет файлы. Он выполняется внутри выбранного
+Codex sandbox и approval policy. Передавайте `client_request_id`, если клиент
+может повторить start request после transport timeout.
 
 Approvals и вопросы:
 
@@ -263,13 +391,22 @@ best-effort inventory вызовы и кеширует snapshot на пять м
 - готовность Windows sandbox;
 - provider capabilities для web search, image generation и namespace tools;
 - счетчики hooks и skills без raw hook commands и абсолютных путей к skills;
+- redacted account status, грубые usage bands и рабочее состояние rate limits;
 - поддерживаемые app-server schema methods с компактным source, version и hash.
+
+Account inventory безопасен для orchestration. Он показывает, авторизован ли
+Codex, тип account и plan, есть ли email, доступен ли usage snapshot и видны ли
+проблемы с rate limits или credits. Он не возвращает raw email, account ids,
+credit balances, spend limits, exact spend used, daily usage buckets и точные
+token counts.
 
 Если один inventory method падает или уходит в timeout, tool все равно
 возвращает `ok=true`, `runtimeCapabilities.status="partial"` и машинно-читаемый
 warning в `methodResults`. Передайте `refresh=true`, чтобы обойти cache.
 `codex_health_summary` показывает небольшой блок `runtimeCapabilities` из
-последнего snapshot и сам app-server не стартует.
+последнего snapshot и сам app-server не стартует. Передайте
+`include_account=false`, если клиенту не нужен account, usage или rate-limit
+status.
 
 ## Progress journal
 
@@ -294,11 +431,16 @@ Stable orchestration tools:
 - `codex_submit_task`
 - `codex_get_operation_status`
 - `codex_start_plan_workflow`
+- `codex_start_review_workflow`
 - `codex_get_workflow_status`
 - `codex_approve_plan`
 - `codex_list_pending_interactions`
 - `codex_answer_pending_interaction`
 - `codex_interrupt_turn`
+- `codex_archive_thread`
+- `codex_unarchive_thread`
+- `codex_start_thread_compaction`
+- `codex_get_thread_compaction_status`
 - `codex_get_runtime_capabilities`
 - `codex_health_summary`
 - `codex_collect_diagnostics`
@@ -377,6 +519,8 @@ stable/compatibility tools.
 - `CODEX_MCP_DEFAULT_APPROVAL_POLICY`: default approval policy для write-операций. По умолчанию `on-request`.
 - `CODEX_MCP_DEFAULT_MODEL`: default Codex model для app-server.
 - `CODEX_MCP_DEFAULT_EFFORT`: default effort level.
+- `CODEX_MCP_MAX_IMAGE_INPUT_ITEMS`: максимум image attachments на `codex_submit_task`. По умолчанию `10`.
+- `CODEX_MCP_MAX_IMAGE_INPUT_BYTES`: максимум bytes для одного local image input. По умолчанию `20000000`.
 - `CODEX_MCP_APPROVAL_RESPONSE_TIMEOUT_SECONDS`: timeout pending interactions.
 - `DEEPSEEK_ENV_PATH`: опциональный `.env` для DeepSeek summary settings.
 - `DEEPSEEK_SUMMARY_ENABLED`: включает или отключает remote summary calls.

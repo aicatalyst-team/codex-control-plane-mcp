@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from datetime import datetime, timezone
@@ -9,6 +10,7 @@ from typing import Any
 
 SECRET_KEY_RE = re.compile(r"(?i)(api[_-]?key|token|password|secret|authorization)\s*[:=]\s*([^\s,;\"']+)")
 BEARER_RE = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{12,}")
+EMAIL_RE = re.compile(r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b")
 OPENAI_KEY_RE = re.compile(r"\bsk-[A-Za-z0-9_-]{12,}")
 TELEGRAM_TOKEN_RE = re.compile(r"\b\d{8,}:[A-Za-z0-9_-]{20,}\b")
 SECRET_FIELD_NAMES = {
@@ -23,6 +25,20 @@ SECRET_FIELD_NAMES = {
     "secret",
     "token",
 }
+ACCOUNT_PRIVATE_FIELD_NAMES = {
+    "accountid",
+    "balance",
+    "chatgptaccountid",
+    "email",
+    "identityid",
+    "limitid",
+    "limitname",
+    "organizationid",
+    "orgid",
+    "tenantid",
+    "userid",
+    "workspaceid",
+}
 
 SEVERITY_SCORE = {"error": 3, "warning": 2, "info": 1, "ok": 0}
 
@@ -34,6 +50,7 @@ def now_iso() -> str:
 def redact_text(value: Any, *, max_chars: int | None = None) -> str:
     text = "" if value is None else str(value)
     text = BEARER_RE.sub("Bearer [redacted]", text)
+    text = EMAIL_RE.sub("[redacted-email]", text)
     text = SECRET_KEY_RE.sub(lambda match: f"{match.group(1)}=[redacted]", text)
     text = OPENAI_KEY_RE.sub("sk-[redacted]", text)
     text = TELEGRAM_TOKEN_RE.sub("[telegram-token-redacted]", text)
@@ -44,10 +61,18 @@ def redact_text(value: Any, *, max_chars: int | None = None) -> str:
 
 def redact_payload(value: Any, *, max_string_chars: int = 4000) -> Any:
     if isinstance(value, dict):
+        image_redacted = _redact_image_input_payload(value, max_string_chars=max_string_chars)
+        if image_redacted is not None:
+            return image_redacted
+        redact_spend_values = _looks_like_spend_control(value)
         redacted: dict[str, Any] = {}
         for key, item in value.items():
             key_text = str(key)
             if _secret_key_name(key_text):
+                redacted[key_text] = "[redacted]"
+            elif _account_private_key_name(key_text):
+                redacted[key_text] = _redacted_account_value(key_text, item)
+            elif redact_spend_values and _normalized_key(key_text) in {"limit", "used"}:
                 redacted[key_text] = "[redacted]"
             else:
                 redacted[key_text] = redact_payload(item, max_string_chars=max_string_chars)
@@ -57,6 +82,33 @@ def redact_payload(value: Any, *, max_string_chars: int = 4000) -> Any:
     if isinstance(value, str):
         return redact_text(value, max_chars=max_string_chars)
     return value
+
+
+def _redact_image_input_payload(value: dict[str, Any], *, max_string_chars: int) -> dict[str, Any] | None:
+    item_type = str(value.get("type") or "")
+    if item_type not in {"image", "localImage"}:
+        return None
+    redacted: dict[str, Any] = {}
+    for key, item in value.items():
+        key_text = str(key)
+        if item_type == "image" and key_text == "url":
+            url = "" if item is None else str(item)
+            redacted["url"] = "[redacted-image-url]"
+            redacted["urlHash"] = hashlib.sha256(url.encode("utf-8")).hexdigest()[:32] if url else None
+            continue
+        if item_type == "localImage" and key_text == "path":
+            path = "" if item is None else str(item)
+            redacted["path"] = "[redacted-local-image-path]"
+            redacted["pathHash"] = hashlib.sha256(path.encode("utf-8")).hexdigest()[:32] if path else None
+            suffix = Path(path).suffix.casefold() if path else ""
+            if suffix:
+                redacted["extension"] = suffix
+            continue
+        if _secret_key_name(key_text):
+            redacted[key_text] = "[redacted]"
+        else:
+            redacted[key_text] = redact_payload(item, max_string_chars=max_string_chars)
+    return redacted
 
 
 def check(name: str, status: str, message: str, *, details: dict[str, Any] | None = None, suggested_action: str | None = None) -> dict[str, Any]:
@@ -419,8 +471,28 @@ def event_to_tool(row: dict[str, Any], *, include_payload: bool, max_payload_cha
 
 
 def _secret_key_name(value: str) -> bool:
-    normalized = re.sub(r"[^a-z0-9]", "", value.casefold())
+    normalized = _normalized_key(value)
     return normalized in SECRET_FIELD_NAMES or any(token in normalized for token in ("apikey", "secret", "token", "password"))
+
+
+def _account_private_key_name(value: str) -> bool:
+    return _normalized_key(value) in ACCOUNT_PRIVATE_FIELD_NAMES
+
+
+def _redacted_account_value(key: str, value: Any) -> Any:
+    normalized = _normalized_key(key)
+    if normalized == "email":
+        return {"present": isinstance(value, str) and bool(value.strip()), "redacted": True}
+    return "[redacted]"
+
+
+def _looks_like_spend_control(value: dict[str, Any]) -> bool:
+    keys = {_normalized_key(str(key)) for key in value.keys()}
+    return bool({"limit", "used"} & keys) and ("remainingpercent" in keys or "resetsat" in keys)
+
+
+def _normalized_key(value: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", value.casefold())
 
 
 def _matching_evidence(logs: list[dict[str, Any]], events: list[dict[str, Any]], markers: tuple[str, ...]) -> list[Any]:

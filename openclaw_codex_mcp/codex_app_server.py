@@ -243,6 +243,32 @@ class CodexAppServerClient:
     async def thread_resume(self, thread_id: str, cwd: str, timeout_seconds: float | None = 60) -> dict[str, Any]:
         return await self.request("thread/resume", {"threadId": thread_id, "cwd": cwd}, timeout_seconds=timeout_seconds)
 
+    async def thread_fork(
+        self,
+        *,
+        thread_id: str,
+        cwd: str | None = None,
+        approval_policy: str | None = None,
+        sandbox: str | None = None,
+        model: str | None = None,
+        config: dict[str, Any] | None = None,
+        ephemeral: bool = False,
+        timeout_seconds: float | None = 60,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {"threadId": thread_id, "ephemeral": bool(ephemeral)}
+        if cwd:
+            params["cwd"] = cwd
+        if approval_policy:
+            params["approvalPolicy"] = approval_policy
+        if sandbox:
+            params["sandbox"] = sandbox
+        if model:
+            params["model"] = model
+        if config is not None:
+            params["config"] = config
+        result = await self.request("thread/fork", params, timeout_seconds=timeout_seconds)
+        return result if isinstance(result, dict) else {"result": result}
+
     async def thread_list(self, cwd: str) -> dict[str, Any]:
         return await self.request("thread/list", {"cwd": cwd}, timeout_seconds=60)
 
@@ -251,6 +277,59 @@ class CodexAppServerClient:
 
     async def thread_name_set(self, thread_id: str, name: str) -> dict[str, Any]:
         return await self.request("thread/name/set", {"threadId": thread_id, "name": name}, timeout_seconds=30)
+
+    async def thread_archive(self, thread_id: str, timeout_seconds: float | None = 30) -> dict[str, Any]:
+        result = await self.request("thread/archive", {"threadId": thread_id}, timeout_seconds=timeout_seconds)
+        return result if isinstance(result, dict) else {"result": result}
+
+    async def thread_unarchive(self, thread_id: str, timeout_seconds: float | None = 30) -> dict[str, Any]:
+        result = await self.request("thread/unarchive", {"threadId": thread_id}, timeout_seconds=timeout_seconds)
+        return result if isinstance(result, dict) else {"result": result}
+
+    async def thread_compact_start(self, thread_id: str, timeout_seconds: float | None = 30) -> dict[str, Any]:
+        result = await self.request("thread/compact/start", {"threadId": thread_id}, timeout_seconds=timeout_seconds)
+        return result if isinstance(result, dict) else {"result": result}
+
+    async def thread_goal_get(self, thread_id: str, timeout_seconds: float | None = 2) -> dict[str, Any]:
+        result = await self.request("thread/goal/get", {"threadId": thread_id}, timeout_seconds=timeout_seconds)
+        return result if isinstance(result, dict) else {"goal": result}
+
+    async def thread_goal_set(
+        self,
+        thread_id: str,
+        *,
+        objective: str | None,
+        status: str | None = "active",
+        token_budget: int | None = None,
+        timeout_seconds: float | None = 5,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {"threadId": thread_id}
+        if objective is not None:
+            params["objective"] = objective
+        if status is not None:
+            params["status"] = status
+        if token_budget is not None:
+            params["tokenBudget"] = int(token_budget)
+        result = await self.request("thread/goal/set", params, timeout_seconds=timeout_seconds)
+        return result if isinstance(result, dict) else {"goal": result}
+
+    async def thread_goal_clear(self, thread_id: str, timeout_seconds: float | None = 5) -> dict[str, Any]:
+        result = await self.request("thread/goal/clear", {"threadId": thread_id}, timeout_seconds=timeout_seconds)
+        return result if isinstance(result, dict) else {"cleared": bool(result)}
+
+    async def review_start(
+        self,
+        *,
+        thread_id: str,
+        target: dict[str, Any],
+        delivery: str | None = None,
+        timeout_seconds: float | None = 60,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {"threadId": thread_id, "target": target}
+        if delivery:
+            params["delivery"] = delivery
+        result = await self.request("review/start", params, timeout_seconds=timeout_seconds)
+        return result if isinstance(result, dict) else {"result": result}
 
     async def turn_start(
         self,
@@ -264,6 +343,7 @@ class CodexAppServerClient:
         effort: str,
         summary: str,
         collaboration_mode: dict[str, Any] | None = None,
+        output_schema: dict[str, Any] | None = None,
         chat_id: str | None = None,
         project_id: str | None = None,
         project_path: str | None = None,
@@ -282,6 +362,8 @@ class CodexAppServerClient:
             params["model"] = model
         if collaboration_mode is not None:
             params["collaborationMode"] = collaboration_mode
+        if output_schema is not None:
+            params["outputSchema"] = output_schema
         result = await self.request("turn/start", params, timeout_seconds=timeout_seconds)
         turn_id = _result_turn_id(result)
         if turn_id:
@@ -375,6 +457,18 @@ class CodexAppServerClient:
     async def model_provider_capabilities_read(self, *, timeout_seconds: float | None = 2) -> dict[str, Any]:
         result = await self.request("modelProvider/capabilities/read", {}, timeout_seconds=timeout_seconds)
         return result if isinstance(result, dict) else {"result": result}
+
+    async def account_read(self, *, refresh_token: bool = False, timeout_seconds: float | None = 2) -> dict[str, Any]:
+        result = await self.request("account/read", {"refreshToken": bool(refresh_token)}, timeout_seconds=timeout_seconds)
+        return result if isinstance(result, dict) else {"account": result}
+
+    async def account_usage_read(self, *, timeout_seconds: float | None = 2) -> dict[str, Any]:
+        result = await self.request("account/usage/read", {}, timeout_seconds=timeout_seconds)
+        return result if isinstance(result, dict) else {"summary": result}
+
+    async def account_rate_limits_read(self, *, timeout_seconds: float | None = 2) -> dict[str, Any]:
+        result = await self.request("account/rateLimits/read", {}, timeout_seconds=timeout_seconds)
+        return result if isinstance(result, dict) else {"rateLimits": result}
 
     async def _ensure_running(self) -> None:
         if self.process is None or self.process.returncode is not None:

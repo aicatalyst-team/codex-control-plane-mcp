@@ -15,7 +15,7 @@ from types import SimpleNamespace
 
 from openclaw_codex_mcp.catalog import project_id_for_path
 from openclaw_codex_mcp.config import ServerConfig, path_key
-from openclaw_codex_mcp.diagnostics import analyze_context, redact_payload, redact_text
+from openclaw_codex_mcp.diagnostics import analyze_context, event_to_tool, redact_payload, redact_text
 from openclaw_codex_mcp.errors import CodexMcpError
 from openclaw_codex_mcp.hook_installer import hook_status, install_hooks, uninstall_hooks
 from openclaw_codex_mcp.hooks.codex_sqlite_journal import record_payload
@@ -189,11 +189,66 @@ class FakeAppServer:
         self.interactions = PendingInteractionManager(storage)
         self.first_message = first_message
         self.process_generation = 1
+        self.process = SimpleNamespace(returncode=None)
         self.turn_start_calls: list[dict] = []
         self.turn_steer_calls: list[dict] = []
+        self.review_start_calls: list[dict] = []
         self.thread_start_calls: list[dict] = []
+        self.thread_fork_calls: list[dict] = []
+        self.thread_archive_calls: list[dict] = []
+        self.thread_unarchive_calls: list[dict] = []
+        self.thread_compact_start_calls: list[dict] = []
+        self.thread_goal_get_calls: list[dict] = []
+        self.thread_goal_set_calls: list[dict] = []
+        self.thread_goal_clear_calls: list[dict] = []
+        self.thread_goal_failures: dict[str, Exception] = {}
+        self.thread_goals: dict[str, dict] = {}
         self.inventory_calls: list[str] = []
         self.inventory_failures: dict[str, Exception] = {}
+        self.account_response: dict = {
+            "requiresOpenaiAuth": False,
+            "account": {"type": "chatgpt", "email": "user@example.com", "planType": "pro", "accountId": "acct_secret"},
+        }
+        self.account_usage_response: dict = {
+            "summary": {
+                "lifetimeTokens": 123456789,
+                "peakDailyTokens": 987654,
+                "currentStreakDays": 9,
+                "longestStreakDays": 42,
+                "longestRunningTurnSec": 7200,
+            },
+            "dailyUsageBuckets": [{"startDate": "2026-06-17", "tokens": 12345}],
+        }
+        self.account_rate_limits_response: dict = {
+            "rateLimits": {
+                "limitId": "private-limit-id",
+                "limitName": "Private Team Bucket",
+                "planType": "pro",
+                "rateLimitReachedType": "none",
+                "credits": {"hasCredits": True, "unlimited": False, "balance": 99.95},
+                "primary": {"usedPercent": 12.5, "resetsAt": "2026-06-18T12:00:00+00:00", "windowDurationMins": 300},
+                "secondary": {"usedPercent": 91.0, "resetsAt": "2026-06-18T13:00:00+00:00", "windowDurationMins": 10080},
+                "individualLimit": {"limit": 100.0, "used": 12.0, "remainingPercent": 88.0, "resetsAt": "2026-06-19T00:00:00+00:00"},
+            },
+            "rateLimitsByLimitId": {
+                "codex": {
+                    "limitId": "codex",
+                    "limitName": "Codex",
+                    "planType": "pro",
+                    "rateLimitReachedType": "none",
+                    "credits": {"hasCredits": True, "unlimited": False, "balance": 99.95},
+                    "primary": {"usedPercent": 12.5, "resetsAt": "2026-06-18T12:00:00+00:00", "windowDurationMins": 300},
+                },
+                "private-limit-id": {
+                    "limitId": "private-limit-id",
+                    "limitName": "Private Team Bucket",
+                    "planType": "pro",
+                    "rateLimitReachedType": "hard",
+                    "credits": {"hasCredits": False, "unlimited": False, "balance": 0.0},
+                    "primary": {"usedPercent": 100.0, "resetsAt": "2026-06-18T12:00:00+00:00", "windowDurationMins": 300},
+                },
+            },
+        }
         self.initialize_result = {
             "protocolVersion": "2025-01-10",
             "serverInfo": {"name": "codex-app-server", "version": "test"},
@@ -201,6 +256,9 @@ class FakeAppServer:
             "userAgent": "codex-app-server-test",
         }
         self._turn_counter = 0
+        self._fork_counter = 0
+        self._review_counter = 0
+        self.review_start_failure: Exception | None = None
 
     async def start(self) -> None:
         return None
@@ -215,8 +273,132 @@ class FakeAppServer:
         self.thread_start_calls.append(dict(kwargs))
         return {"threadId": "thread-new"}
 
+    async def thread_fork(self, **kwargs: object) -> dict:
+        self._fork_counter += 1
+        thread_id = "thread-fork" if self._fork_counter == 1 else f"thread-fork-{self._fork_counter}"
+        self.thread_fork_calls.append(dict(kwargs))
+        return {
+            "thread": {"id": thread_id},
+            "cwd": kwargs.get("cwd"),
+            "approvalPolicy": kwargs.get("approval_policy"),
+            "sandbox": kwargs.get("sandbox"),
+            "model": kwargs.get("model"),
+            "_processGeneration": self.process_generation,
+        }
+
     async def thread_name_set(self, thread_id: str, name: str) -> dict:
         return {}
+
+    async def thread_archive(self, thread_id: str, timeout_seconds: float | None = 30) -> dict:
+        self.thread_archive_calls.append({"thread_id": thread_id, "timeout_seconds": timeout_seconds})
+        return {"archived": True, "threadId": thread_id, "_processGeneration": self.process_generation}
+
+    async def thread_unarchive(self, thread_id: str, timeout_seconds: float | None = 30) -> dict:
+        self.thread_unarchive_calls.append({"thread_id": thread_id, "timeout_seconds": timeout_seconds})
+        return {"thread": {"id": thread_id}, "_processGeneration": self.process_generation}
+
+    async def thread_compact_start(self, thread_id: str, timeout_seconds: float | None = 30) -> dict:
+        self.thread_compact_start_calls.append({"thread_id": thread_id, "timeout_seconds": timeout_seconds})
+        return {"started": True, "threadId": thread_id, "_processGeneration": self.process_generation}
+
+    async def thread_goal_get(self, thread_id: str, timeout_seconds: float | None = 2) -> dict:
+        self.thread_goal_get_calls.append({"thread_id": thread_id, "timeout_seconds": timeout_seconds})
+        failure = self.thread_goal_failures.get("get")
+        if failure is not None:
+            raise failure
+        goal = self.thread_goals.get(thread_id)
+        return {"goal": dict(goal) if goal is not None else None, "_processGeneration": self.process_generation}
+
+    async def thread_goal_set(
+        self,
+        thread_id: str,
+        *,
+        objective: str | None,
+        status: str | None = "active",
+        token_budget: int | None = None,
+        timeout_seconds: float | None = 5,
+    ) -> dict:
+        self.thread_goal_set_calls.append(
+            {
+                "thread_id": thread_id,
+                "objective": objective,
+                "status": status,
+                "token_budget": token_budget,
+                "timeout_seconds": timeout_seconds,
+            }
+        )
+        failure = self.thread_goal_failures.get("set")
+        if failure is not None:
+            raise failure
+        existing = self.thread_goals.get(thread_id) or {}
+        goal = {
+            "threadId": thread_id,
+            "objective": objective or "",
+            "status": status or "active",
+            "tokenBudget": token_budget,
+            "tokensUsed": int(existing.get("tokensUsed") or 0),
+            "timeUsedSeconds": int(existing.get("timeUsedSeconds") or 0),
+            "createdAt": int(existing.get("createdAt") or 1779667200000),
+            "updatedAt": int(existing.get("updatedAt") or 1779667201000) + 1,
+        }
+        self.thread_goals[thread_id] = goal
+        return {"goal": dict(goal), "_processGeneration": self.process_generation}
+
+    async def thread_goal_clear(self, thread_id: str, timeout_seconds: float | None = 5) -> dict:
+        self.thread_goal_clear_calls.append({"thread_id": thread_id, "timeout_seconds": timeout_seconds})
+        failure = self.thread_goal_failures.get("clear")
+        if failure is not None:
+            raise failure
+        self.thread_goals.pop(thread_id, None)
+        return {"cleared": True, "_processGeneration": self.process_generation}
+
+    async def review_start(
+        self,
+        *,
+        thread_id: str,
+        target: dict,
+        delivery: str | None = None,
+        timeout_seconds: float | None = 60,
+    ) -> dict:
+        if self.review_start_failure is not None:
+            raise self.review_start_failure
+        self._review_counter += 1
+        review_thread_id = thread_id if delivery != "detached" else ("thread-review" if self._review_counter == 1 else f"thread-review-{self._review_counter}")
+        turn_id = "turn-review" if self._review_counter == 1 else f"turn-review-{self._review_counter}"
+        self.review_start_calls.append(
+            {
+                "thread_id": thread_id,
+                "target": target,
+                "delivery": delivery,
+                "timeout_seconds": timeout_seconds,
+            }
+        )
+        self.tracker.register_turn(
+            turn_id=turn_id,
+            thread_id=review_thread_id,
+            chat_id=review_thread_id,
+            project_id=None,
+            project_path=None,
+            status="running",
+            process_generation=self.process_generation,
+        )
+        if self.first_message is not None:
+            self.tracker.record_event(
+                {
+                    "method": "item/created",
+                    "params": {
+                        "threadId": review_thread_id,
+                        "turnId": turn_id,
+                        "item": {"type": "agentMessage", "text": self.first_message},
+                    },
+                },
+                received_at="2026-05-25T00:00:01+00:00",
+            )
+        return {
+            "reviewThreadId": review_thread_id,
+            "turn": {"id": turn_id, "status": "inProgress", "items": []},
+            "_processGeneration": self.process_generation,
+        }
 
     async def turn_start(self, **kwargs: object) -> dict:
         self._turn_counter += 1
@@ -396,6 +578,23 @@ class FakeAppServer:
         self._maybe_fail_inventory("modelProvider/capabilities/read")
         self.inventory_calls.append("modelProvider/capabilities/read")
         return {"webSearch": True, "imageGeneration": False, "namespaceTools": True}
+
+    async def account_read(self, *, refresh_token: bool = False, timeout_seconds: float | None = 2) -> dict:
+        self._maybe_fail_inventory("account/read")
+        self.inventory_calls.append("account/read")
+        result = dict(self.account_response)
+        result["refreshToken"] = refresh_token
+        return result
+
+    async def account_usage_read(self, *, timeout_seconds: float | None = 2) -> dict:
+        self._maybe_fail_inventory("account/usage/read")
+        self.inventory_calls.append("account/usage/read")
+        return dict(self.account_usage_response)
+
+    async def account_rate_limits_read(self, *, timeout_seconds: float | None = 2) -> dict:
+        self._maybe_fail_inventory("account/rateLimits/read")
+        self.inventory_calls.append("account/rateLimits/read")
+        return dict(self.account_rate_limits_response)
 
     def _maybe_fail_inventory(self, method: str) -> None:
         failure = self.inventory_failures.get(method)
@@ -640,6 +839,12 @@ class OperationLeaseStorageTests(unittest.TestCase):
                     "wf-storage",
                     current_operation_id="op-plan",
                     plan_operation_id="op-plan",
+                    review_operation_id="op-review",
+                    review_source_thread_id="thread-source",
+                    review_thread_id="thread-review",
+                    review_turn_id="turn-review",
+                    review_target_json='{"type":"uncommittedChanges"}',
+                    review_delivery="detached",
                     latest_plan_item_id="plan-1",
                     latest_plan_hash="hash-plan",
                     final_report_json='{"text":"done"}',
@@ -653,12 +858,64 @@ class OperationLeaseStorageTests(unittest.TestCase):
         self.assertEqual("plan_then_execute", created["workflow_kind"])
         self.assertEqual("", created["thread_id"])
         self.assertIsNone(created["current_operation_id"])
+        self.assertIsNone(created["review_operation_id"])
+        self.assertIsNone(created["review_source_thread_id"])
+        self.assertIsNone(created["review_thread_id"])
+        self.assertIsNone(created["review_turn_id"])
+        self.assertIsNone(created["goal_objective"])
+        self.assertEqual("clear", created["goal_completion_action"])
+        self.assertEqual("not_configured", created["goal_sync_state"])
         self.assertEqual("op-plan", updated["current_operation_id"])
         self.assertEqual("op-plan", updated["plan_operation_id"])
+        self.assertEqual("op-review", updated["review_operation_id"])
+        self.assertEqual("thread-source", updated["review_source_thread_id"])
+        self.assertEqual("thread-review", updated["review_thread_id"])
+        self.assertEqual("turn-review", updated["review_turn_id"])
+        self.assertEqual('{"type":"uncommittedChanges"}', updated["review_target_json"])
+        self.assertEqual("detached", updated["review_delivery"])
         self.assertEqual("plan-1", updated["latest_plan_item_id"])
         self.assertEqual("hash-plan", updated["latest_plan_hash"])
         self.assertEqual("hash-report", updated["latest_report_hash"])
         self.assertEqual('{"text":"done"}', updated["final_report_json"])
+
+    def test_thread_lifecycle_action_storage_roundtrip(self) -> None:
+        with TemporaryDirectory() as tmp:
+            storage = McpStorage(Path(tmp) / "mcp.sqlite")
+            storage.connect()
+            try:
+                row = {
+                    "action_id": "tla-storage",
+                    "action_type": "compact",
+                    "thread_id": "thread-storage",
+                    "project_id": "project-storage",
+                    "status": "running",
+                    "created_at": "2026-05-25T00:00:00+00:00",
+                    "updated_at": "2026-05-25T00:00:00+00:00",
+                    "request_json": '{"thread_id":"thread-storage"}',
+                    "app_server_generation": 3,
+                }
+                created = storage.create_thread_lifecycle_action(row)
+                duplicate = storage.create_thread_lifecycle_action(row)
+                storage.update_thread_lifecycle_action(
+                    "tla-storage",
+                    status="completed",
+                    updated_at="2026-05-25T00:00:05+00:00",
+                    completed_at="2026-05-25T00:00:05+00:00",
+                    result_json='{"done":true}',
+                    observed_event_id=17,
+                    target_turn_id="turn-storage",
+                )
+                fetched = storage.get_thread_lifecycle_action("tla-storage") or {}
+                listed = storage.list_thread_lifecycle_actions(thread_id="thread-storage")
+            finally:
+                storage.close()
+
+        self.assertTrue(created)
+        self.assertFalse(duplicate)
+        self.assertEqual("completed", fetched["status"])
+        self.assertEqual(17, fetched["observed_event_id"])
+        self.assertEqual("turn-storage", fetched["target_turn_id"])
+        self.assertEqual(["tla-storage"], [item["action_id"] for item in listed])
 
     def test_operation_lease_acquire_release_and_expired_pickup(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -714,7 +971,7 @@ class OperationLeaseStorageTests(unittest.TestCase):
                         "chat_id": "thread-progress",
                         "project_id": "project",
                         "project_path": str(Path(tmp)),
-                        "status": "running",
+                        "status": "ready",
                         "started_at": "2026-05-25T00:00:00+00:00",
                         "updated_at": "2026-05-25T00:00:00+00:00",
                         "completed_at": None,
@@ -857,7 +1114,7 @@ class HookHistoryTests(unittest.TestCase):
             stop_payload = {
                 **user_payload,
                 "hook_event_name": "Stop",
-                "last_assistant_message": "Final hook answer with Bearer abcdefghijklmnop",
+                "last_assistant_message": "Final hook answer with " + "Bearer " + "abcdefghijklmnop",
             }
 
             self.assertTrue(record_payload(user_payload, state_db=state_db)["recorded"])
@@ -1034,6 +1291,7 @@ class McpDefinitionTests(unittest.TestCase):
                 "codex_submit_task",
                 "codex_get_operation_status",
                 "codex_start_plan_workflow",
+                "codex_start_review_workflow",
                 "codex_get_workflow_status",
                 "codex_approve_plan",
                 "codex_get_turn_status",
@@ -1041,6 +1299,10 @@ class McpDefinitionTests(unittest.TestCase):
                 "codex_list_pending_interactions",
                 "codex_answer_pending_interaction",
                 "codex_interrupt_turn",
+                "codex_archive_thread",
+                "codex_unarchive_thread",
+                "codex_start_thread_compaction",
+                "codex_get_thread_compaction_status",
                 "codex_restart_app_server",
                 "codex_get_app_server_status",
                 "codex_get_runtime_capabilities",
@@ -1085,13 +1347,21 @@ class McpDefinitionTests(unittest.TestCase):
         self.assertEqual("read-only", send_schema["sandbox"]["default"])
 
         submit_schema = by_name["codex_submit_task"]["inputSchema"]
-        self.assertEqual(["operation_type", "message"], submit_schema["required"])
+        self.assertEqual(["operation_type"], submit_schema["required"])
         self.assertIn("start_chat", submit_schema["properties"]["operation_type"]["enum"])
         self.assertIn("send_message", submit_schema["properties"]["operation_type"]["enum"])
         self.assertIn("execute_plan", submit_schema["properties"]["operation_type"]["enum"])
         self.assertIn("steer_turn", submit_schema["properties"]["operation_type"]["enum"])
+        self.assertIn("fork_thread", submit_schema["properties"]["operation_type"]["enum"])
+        self.assertNotIn("review_start", submit_schema["properties"]["operation_type"]["enum"])
         self.assertIn("thread_id", submit_schema["properties"])
+        self.assertIn("source_thread_id", submit_schema["properties"])
         self.assertIn("expected_turn_id", submit_schema["properties"])
+        self.assertIn("fork_config", submit_schema["properties"])
+        self.assertIn("ephemeral", submit_schema["properties"])
+        self.assertIn("output_schema", submit_schema["properties"])
+        self.assertIn("input_items", submit_schema["properties"])
+        self.assertEqual(["string", "null"], submit_schema["properties"]["message"]["type"])
         self.assertEqual("read-only", submit_schema["properties"]["sandbox"]["default"])
         self.assertEqual("on-request", submit_schema["properties"]["approval_policy"]["default"])
 
@@ -1110,6 +1380,22 @@ class McpDefinitionTests(unittest.TestCase):
         self.assertEqual(0, workflow_schema["first_message_timeout_seconds"]["default"])
         self.assertEqual("read-only", workflow_schema["sandbox"]["default"])
         self.assertEqual("on-request", workflow_schema["approval_policy"]["default"])
+        self.assertIn("goal", workflow_schema)
+        self.assertIn("goal_token_budget", workflow_schema)
+        self.assertEqual("clear", workflow_schema["goal_completion_action"]["default"])
+        self.assertIn("set_complete", workflow_schema["goal_completion_action"]["enum"])
+
+        review_schema = by_name["codex_start_review_workflow"]["inputSchema"]
+        self.assertEqual(["target_type"], review_schema["required"])
+        self.assertIn("thread_id", review_schema["properties"])
+        self.assertIn("project_id", review_schema["properties"])
+        self.assertIn("cwd", review_schema["properties"])
+        self.assertIn("base_branch", review_schema["properties"])
+        self.assertIn("commit_sha", review_schema["properties"])
+        self.assertIn("instructions", review_schema["properties"])
+        self.assertIn("detached", review_schema["properties"]["delivery"]["enum"])
+        self.assertEqual("read-only", review_schema["properties"]["sandbox"]["default"])
+        self.assertEqual("on-request", review_schema["properties"]["approval_policy"]["default"])
 
         workflow_status_schema = by_name["codex_get_workflow_status"]["inputSchema"]
         self.assertEqual(["workflow_id"], workflow_status_schema["required"])
@@ -1119,6 +1405,7 @@ class McpDefinitionTests(unittest.TestCase):
         self.assertEqual("Implement the plan.", approve_plan_schema["properties"]["message"]["default"])
         self.assertEqual("read-only", approve_plan_schema["properties"]["sandbox"]["default"])
         self.assertEqual("on-request", approve_plan_schema["properties"]["approval_policy"]["default"])
+        self.assertIn("output_schema", approve_plan_schema["properties"])
 
         execute_plan_schema = by_name["codex_execute_plan"]["inputSchema"]
         self.assertNotIn("required", execute_plan_schema)
@@ -1127,6 +1414,7 @@ class McpDefinitionTests(unittest.TestCase):
         self.assertEqual("Implement the plan.", execute_plan_schema["properties"]["message"]["default"])
         self.assertEqual("read-only", execute_plan_schema["properties"]["sandbox"]["default"])
         self.assertEqual("on-request", execute_plan_schema["properties"]["approval_policy"]["default"])
+        self.assertIn("output_schema", execute_plan_schema["properties"])
 
         pending_schema = by_name["codex_list_pending_interactions"]["inputSchema"]["properties"]
         self.assertEqual("pending", pending_schema["status"]["default"])
@@ -1142,6 +1430,16 @@ class McpDefinitionTests(unittest.TestCase):
         self.assertIn("operation_id", interrupt_schema["properties"])
         self.assertIn("workflow_id", interrupt_schema["properties"])
 
+        archive_schema = by_name["codex_archive_thread"]["inputSchema"]
+        unarchive_schema = by_name["codex_unarchive_thread"]["inputSchema"]
+        compact_start_schema = by_name["codex_start_thread_compaction"]["inputSchema"]
+        compact_status_schema = by_name["codex_get_thread_compaction_status"]["inputSchema"]
+        self.assertEqual(["thread_id"], archive_schema["required"])
+        self.assertEqual(["thread_id"], unarchive_schema["required"])
+        self.assertEqual(["thread_id"], compact_start_schema["required"])
+        self.assertEqual(["action_id"], compact_status_schema["required"])
+        self.assertNotIn("codex_delete_thread", by_name)
+
         restart_schema = by_name["codex_restart_app_server"]["inputSchema"]["properties"]
         self.assertIn("force", restart_schema)
 
@@ -1152,6 +1450,7 @@ class McpDefinitionTests(unittest.TestCase):
         self.assertTrue(runtime_schema["include_models"]["default"])
         self.assertTrue(runtime_schema["include_hooks"]["default"])
         self.assertTrue(runtime_schema["include_skills"]["default"])
+        self.assertTrue(runtime_schema["include_account"]["default"])
 
         diagnostics_schema = by_name["codex_collect_diagnostics"]["inputSchema"]["properties"]
         self.assertIn("operation_id", diagnostics_schema)
@@ -1225,7 +1524,7 @@ class McpDefinitionTests(unittest.TestCase):
         self.assertTrue(first["ok"])
         self.assertEqual("ok", first["runtimeCapabilities"]["status"])
         self.assertFalse(first["cacheState"]["hit"])
-        self.assertEqual(6, first_call_count)
+        self.assertEqual(9, first_call_count)
         self.assertTrue(second["cacheState"]["hit"])
         self.assertEqual(first_call_count, after_cache_count)
         self.assertFalse(refreshed["cacheState"]["hit"])
@@ -1242,6 +1541,19 @@ class McpDefinitionTests(unittest.TestCase):
         self.assertEqual(2, capabilities["skills"]["skillCount"])
         self.assertEqual(82, capabilities["schemaMethods"]["methodCount"])
         self.assertIn("turn/steer", capabilities["schemaMethods"]["methods"])
+        self.assertTrue(capabilities["accountStatus"]["authenticated"])
+        self.assertEqual("chatgpt", capabilities["accountStatus"]["accountType"])
+        self.assertEqual("pro", capabilities["accountStatus"]["planType"])
+        self.assertTrue(capabilities["accountStatus"]["emailPresent"])
+        self.assertTrue(capabilities["accountStatus"]["identityRedacted"])
+        self.assertTrue(capabilities["accountUsage"]["available"])
+        self.assertEqual(1, capabilities["accountUsage"]["dailyBucketCount"])
+        self.assertEqual("100m_plus", capabilities["accountUsage"]["summary"]["lifetimeUsageBand"])
+        self.assertTrue(capabilities["rateLimits"]["available"])
+        self.assertTrue(capabilities["rateLimits"]["credits"]["hasCredits"])
+        self.assertTrue(capabilities["rateLimits"]["credits"]["balanceRedacted"])
+        self.assertTrue(capabilities["rateLimits"]["rateLimitReached"])
+        self.assertIn("bucketHash", capabilities["rateLimits"]["primary"])
 
         rendered = json.dumps(first, ensure_ascii=False)
         self.assertNotIn("run-hook.ps1", rendered)
@@ -1250,12 +1562,27 @@ class McpDefinitionTests(unittest.TestCase):
         self.assertNotIn("C:\\Secret", rendered)
         self.assertNotIn("D:\\private", rendered)
         self.assertNotIn("sk-secret", rendered)
+        self.assertNotIn("user@example.com", rendered)
+        self.assertNotIn("acct_secret", rendered)
+        self.assertNotIn("99.95", rendered)
+        self.assertNotIn("Private Team Bucket", rendered)
+        self.assertNotIn("private-limit-id", rendered)
+        self.assertNotIn("123456789", rendered)
+        self.assertNotIn("dailyUsageBuckets", rendered)
+        self.assertNotIn("startDate", rendered)
+        self.assertNotIn('"tokens"', rendered)
 
         runtime_health = health["runtimeCapabilities"]
         self.assertEqual("ok", runtime_health["status"])
         self.assertEqual(2, runtime_health["modelCount"])
         self.assertEqual("gpt-5", runtime_health["defaultModel"])
         self.assertEqual("ready", runtime_health["sandboxReadiness"])
+        self.assertTrue(runtime_health["accountAuthenticated"])
+        self.assertEqual("chatgpt", runtime_health["accountType"])
+        self.assertEqual("pro", runtime_health["planType"])
+        self.assertTrue(runtime_health["rateLimitReached"])
+        self.assertTrue(runtime_health["creditsAvailable"])
+        self.assertTrue(runtime_health["usageAvailable"])
         self.assertEqual(0, runtime_health["warningsCount"])
 
     def test_runtime_capabilities_method_timeout_is_partial_ok(self) -> None:
@@ -1290,7 +1617,12 @@ class McpDefinitionTests(unittest.TestCase):
             try:
                 result = asyncio.run(
                     service.codex_get_runtime_capabilities(
-                        {"include_models": False, "include_hooks": False, "include_skills": False}
+                        {
+                            "include_models": False,
+                            "include_hooks": False,
+                            "include_skills": False,
+                            "include_account": False,
+                        }
                     )
                 )
             finally:
@@ -1300,9 +1632,100 @@ class McpDefinitionTests(unittest.TestCase):
         self.assertEqual("skipped", result["methodResults"]["model/list"]["status"])
         self.assertEqual("skipped", result["methodResults"]["hooks/list"]["status"])
         self.assertEqual("skipped", result["methodResults"]["skills/list"]["status"])
+        self.assertEqual("skipped", result["methodResults"]["account/read"]["status"])
+        self.assertEqual("skipped", result["methodResults"]["account/usage/read"]["status"])
+        self.assertEqual("skipped", result["methodResults"]["account/rateLimits/read"]["status"])
         self.assertNotIn("model/list", fake.inventory_calls)
         self.assertNotIn("hooks/list", fake.inventory_calls)
         self.assertNotIn("skills/list", fake.inventory_calls)
+        self.assertNotIn("account/read", fake.inventory_calls)
+        self.assertNotIn("account/usage/read", fake.inventory_calls)
+        self.assertNotIn("account/rateLimits/read", fake.inventory_calls)
+
+    def test_runtime_capabilities_unauthenticated_skips_account_usage_and_limits(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = _search_service_config(root, root / ".codex" / "state_runtime_unauth.sqlite")
+            service = ToolService(config)
+            fake = FakeAppServer(service.storage)
+            fake.account_response = {"requiresOpenaiAuth": True, "account": None}
+            service._app_server = fake  # type: ignore[assignment]
+            try:
+                result = asyncio.run(service.codex_get_runtime_capabilities({}))
+            finally:
+                asyncio.run(service.close())
+
+        self.assertTrue(result["ok"])
+        self.assertEqual("ok", result["runtimeCapabilities"]["status"])
+        self.assertFalse(result["runtimeCapabilities"]["accountStatus"]["authenticated"])
+        self.assertTrue(result["runtimeCapabilities"]["accountStatus"]["requiresOpenaiAuth"])
+        self.assertIsNone(result["runtimeCapabilities"]["accountUsage"])
+        self.assertIsNone(result["runtimeCapabilities"]["rateLimits"])
+        self.assertEqual("skipped", result["methodResults"]["account/usage/read"]["status"])
+        self.assertEqual("unauthenticated", result["methodResults"]["account/usage/read"]["reason"])
+        self.assertEqual("skipped", result["methodResults"]["account/rateLimits/read"]["status"])
+        self.assertNotIn("account/usage/read", fake.inventory_calls)
+        self.assertNotIn("account/rateLimits/read", fake.inventory_calls)
+
+    def test_runtime_capabilities_account_timeout_is_partial_and_skips_children(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = _search_service_config(root, root / ".codex" / "state_runtime_account_timeout.sqlite")
+            service = ToolService(config)
+            fake = FakeAppServer(service.storage)
+            fake.inventory_failures["account/read"] = CodexMcpError("CODEX_TIMEOUT", "account timed out", retryable=True)
+            service._app_server = fake  # type: ignore[assignment]
+            try:
+                result = asyncio.run(service.codex_get_runtime_capabilities({}))
+            finally:
+                asyncio.run(service.close())
+
+        self.assertTrue(result["ok"])
+        self.assertEqual("partial", result["runtimeCapabilities"]["status"])
+        self.assertIsNone(result["runtimeCapabilities"]["accountStatus"])
+        self.assertIsNone(result["runtimeCapabilities"]["accountUsage"])
+        self.assertIsNone(result["runtimeCapabilities"]["rateLimits"])
+        self.assertEqual("timeout", result["methodResults"]["account/read"]["status"])
+        self.assertEqual("account_status_unavailable", result["methodResults"]["account/usage/read"]["reason"])
+        self.assertEqual("account_status_unavailable", result["methodResults"]["account/rateLimits/read"]["reason"])
+
+    def test_diagnostic_event_payload_redacts_account_and_rate_limit_fields(self) -> None:
+        row = {
+            "id": 1,
+            "direction": "inbound",
+            "jsonrpc_id": 10,
+            "method": "account/rateLimits/read",
+            "thread_id": None,
+            "turn_id": None,
+            "process_generation": 1,
+            "received_at": "2026-06-18T00:00:00+00:00",
+            "payload_json": json.dumps(
+                {
+                    "result": {
+                        "account": {"email": "user@example.com", "accountId": "acct_secret"},
+                        "rateLimits": {
+                            "limitId": "private-limit-id",
+                            "limitName": "Private Team Bucket",
+                            "credits": {"balance": 99.95, "hasCredits": True},
+                            "individualLimit": {"limit": 100, "used": 12, "remainingPercent": 88, "resetsAt": "2026-06-19T00:00:00Z"},
+                        },
+                    }
+                }
+            ),
+        }
+
+        payload = event_to_tool(row, include_payload=True)["payload"]
+        rendered = json.dumps(payload, ensure_ascii=False)
+
+        self.assertNotIn("user@example.com", rendered)
+        self.assertNotIn("acct_secret", rendered)
+        self.assertNotIn("private-limit-id", rendered)
+        self.assertNotIn("Private Team Bucket", rendered)
+        self.assertNotIn("99.95", rendered)
+        self.assertNotIn('"limit": 100', rendered)
+        self.assertNotIn('"used": 12', rendered)
+        self.assertIn("[redacted]", rendered)
+        self.assertIn("[redacted-email]", redact_text("contact user@example.com"))
 
     def test_pending_interaction_response_builders(self) -> None:
         self.assertEqual(
@@ -1538,11 +1961,14 @@ class McpDefinitionTests(unittest.TestCase):
                 self.assertEqual("", stderr)
 
     def test_diagnostic_redaction_and_classifier(self) -> None:
-        text = "DEEPSEEK_API_KEY=secret-value Authorization: Bearer abcdefghijklmnop sk-1234567890abcdef 123456789:abcdefghijklmnopqrstuvwxyz"
+        fake_bearer = "Bearer " + "abcdefghijklmnop"
+        fake_openai_key = "sk-" + "1234567890abcdef"
+        fake_telegram_token = "123456789:" + "abcdefghijklmnopqrstuvwxyz"
+        text = f"DEEPSEEK_API_KEY=secret-value Authorization: {fake_bearer} {fake_openai_key} {fake_telegram_token}"
         redacted = redact_text(text)
         self.assertNotIn("secret-value", redacted)
         self.assertNotIn("abcdefghijklmnop", redacted)
-        self.assertNotIn("sk-1234567890abcdef", redacted)
+        self.assertNotIn(fake_openai_key, redacted)
         self.assertNotIn("abcdefghijklmnopqrstuvwxyz", redacted)
 
         payload = redact_payload({"token": "visible-secret", "nested": {"password": "pw", "safe": "ok"}})
@@ -1689,7 +2115,7 @@ class McpDefinitionTests(unittest.TestCase):
                         "chat_id": "thread-health",
                         "project_id": "project",
                         "project_path": str(root),
-                        "status": "running",
+                        "status": "ready",
                         "started_at": old,
                         "updated_at": old,
                         "completed_at": None,
@@ -1986,7 +2412,7 @@ class McpDefinitionTests(unittest.TestCase):
                             "turns": [
                                 {
                                     "id": "turn-snapshot",
-                                    "status": "completed",
+                                    "status": {"type": "idle"},
                                     "startedAt": 1779667200000,
                                     "completedAt": 1779667205000,
                                     "items": [{"type": "plan", "id": "plan-snapshot", "text": "Snapshot plan"}],
@@ -2148,7 +2574,7 @@ class McpDefinitionTests(unittest.TestCase):
                         "chat_id": "thread-live",
                         "project_id": "project-live",
                         "project_path": str(root),
-                        "status": "running",
+                        "status": "ready",
                         "started_at": "2026-05-25T00:00:00+00:00",
                         "updated_at": "2026-05-25T00:00:01+00:00",
                         "completed_at": None,
@@ -2176,7 +2602,7 @@ class McpDefinitionTests(unittest.TestCase):
                 asyncio.run(service.close())
 
         self.assertEqual("turn-live", result["turn_id"])
-        self.assertEqual("running", result["status"])
+        self.assertEqual("completed", result["status"])
         self.assertEqual(["live assistant"], [item["text"] for item in result["last_messages"]])
 
     def test_pending_interaction_tools_list_and_answer_live_request(self) -> None:
@@ -2360,6 +2786,775 @@ class McpDefinitionTests(unittest.TestCase):
         self.assertEqual("plan", turn_start_calls[0]["collaboration_mode"]["mode"])
         self.assertEqual("default", turn_start_calls[1]["collaboration_mode"]["mode"])
         self.assertEqual(2, len(turn_start_calls))
+
+    def test_plan_workflow_uses_completed_assistant_message_as_plan_fallback(self) -> None:
+        async def scenario() -> dict:
+            with TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                project = root / "Project"
+                project.mkdir()
+                config = _search_service_config(root, root / ".codex" / "state_5.sqlite")
+                service = ToolService(config)
+                fake = FakeAppServer(service.storage, first_message=None)
+                service._app_server = fake  # type: ignore[assignment]
+                try:
+                    started = await service.codex_start_plan_workflow(
+                        {
+                            "project_id": project_id_for_path(str(project)),
+                            "message": "prepare a plain text plan",
+                            "client_request_id": "workflow-plan-fallback",
+                            "first_message_timeout_seconds": 1,
+                        }
+                    )
+                    for _ in range(20):
+                        running = service.codex_get_workflow_status({"workflow_id": started["workflowId"]})
+                        if running["planTurnId"]:
+                            break
+                        await asyncio.sleep(0.01)
+                    else:
+                        self.fail("Plan operation did not produce planTurnId")
+                    service.storage.update_tracked_turn_status(
+                        running["planTurnId"],
+                        status="completed",
+                        updated_at="2026-05-25T00:00:02+00:00",
+                        completed_at="2026-05-25T00:00:02+00:00",
+                        final_message="Plain assistant plan fallback",
+                    )
+                    return service.codex_get_workflow_status({"workflow_id": started["workflowId"]})
+                finally:
+                    await service.close()
+
+        ready = asyncio.run(scenario())
+
+        self.assertEqual("plan_ready", ready["phase"])
+        self.assertEqual("Plain assistant plan fallback", ready["latestPlan"]["markdown"])
+        self.assertEqual("completed", ready["latestPlan"]["status"])
+
+    def test_review_workflow_validation_errors_are_structured(self) -> None:
+        async def scenario() -> tuple[dict, dict, dict, dict, dict]:
+            with TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                project = root / "Project"
+                project.mkdir()
+                service = ToolService(_search_service_config(root, root / ".codex" / "state_5.sqlite"))
+                try:
+                    missing_context = await service.call("codex_start_review_workflow", {"target_type": "uncommitted_changes"})
+                    missing_branch = await service.call(
+                        "codex_start_review_workflow",
+                        {"project_id": project_id_for_path(str(project)), "target_type": "base_branch"},
+                    )
+                    missing_instructions = await service.call(
+                        "codex_start_review_workflow",
+                        {"project_id": project_id_for_path(str(project)), "target_type": "custom"},
+                    )
+                    unknown_thread = await service.call(
+                        "codex_start_review_workflow",
+                        {"thread_id": "thread-missing", "target_type": "uncommitted_changes"},
+                    )
+                    service.storage.upsert_tracked_turn(
+                        {
+                            "turn_id": "turn-active-review",
+                            "thread_id": "thread-active-review",
+                            "chat_id": "thread-active-review",
+                            "project_id": project_id_for_path(str(project)),
+                            "project_path": str(project),
+                            "status": "running",
+                            "started_at": "2026-05-25T00:00:00+00:00",
+                            "updated_at": "2026-05-25T00:00:01+00:00",
+                            "completed_at": None,
+                            "first_message_at": None,
+                            "final_message": None,
+                            "last_error": None,
+                            "source": "app_server",
+                        }
+                    )
+                    busy_thread = await service.call(
+                        "codex_start_review_workflow",
+                        {"thread_id": "thread-active-review", "target_type": "uncommitted_changes"},
+                    )
+                    return missing_context, missing_branch, missing_instructions, unknown_thread, busy_thread
+                finally:
+                    await service.close()
+
+        missing_context, missing_branch, missing_instructions, unknown_thread, busy_thread = asyncio.run(scenario())
+
+        self.assertEqual("INVALID_ARGUMENT", missing_context["error"]["code"])
+        self.assertEqual("INVALID_ARGUMENT", missing_branch["error"]["code"])
+        self.assertEqual("INVALID_ARGUMENT", missing_instructions["error"]["code"])
+        self.assertEqual("CODEX_THREAD_NOT_FOUND", unknown_thread["error"]["code"])
+        self.assertEqual("CODEX_BUSY", busy_thread["error"]["code"])
+
+    def test_review_workflow_existing_thread_detached_is_idempotent_and_reports(self) -> None:
+        async def scenario() -> tuple[dict, dict, dict, dict, list[dict], int, int, object]:
+            with TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                project = root / "Project"
+                project.mkdir()
+                sessions = root / ".codex" / "sessions"
+                sessions.mkdir(parents=True)
+                transcript = sessions / "rollout-review-source.jsonl"
+                _write_transcript(transcript, "thread-source", project, [("user", "source request")])
+                state_db = root / ".codex" / "state_5.sqlite"
+                _create_threads_db(
+                    state_db,
+                    [
+                        {
+                            "id": "thread-source",
+                            "rollout_path": str(transcript),
+                            "cwd": str(project),
+                            "title": "Review source",
+                            "preview": "",
+                            "created_at_ms": 1779667200000,
+                            "updated_at_ms": 1779667200000,
+                            "archived": 0,
+                        }
+                    ],
+                )
+                service = ToolService(_search_service_config(root, state_db))
+                fake = FakeAppServer(service.storage, first_message=None)
+                service._app_server = fake  # type: ignore[assignment]
+                try:
+                    started = await service.call(
+                        "codex_start_review_workflow",
+                        {
+                            "thread_id": "thread-source",
+                            "target_type": "base_branch",
+                            "base_branch": "main",
+                            "client_request_id": "review-client-1",
+                        },
+                    )
+                    active = started
+                    for _ in range(50):
+                        active = await service.call("codex_get_workflow_status", {"workflow_id": started["workflowId"]})
+                        if active.get("reviewTurnId"):
+                            break
+                        await asyncio.sleep(0.01)
+                    repeated = await service.call(
+                        "codex_start_review_workflow",
+                        {
+                            "thread_id": "thread-source",
+                            "target_type": "base_branch",
+                            "base_branch": "main",
+                            "client_request_id": "review-client-1",
+                        },
+                    )
+                    service.storage.update_tracked_turn_status(
+                        active["reviewTurnId"],
+                        status="completed",
+                        updated_at="2026-05-25T00:00:04+00:00",
+                        completed_at="2026-05-25T00:00:04+00:00",
+                        final_message="Review report: no issues found.",
+                    )
+                    completed = await service.call("codex_get_workflow_status", {"workflow_id": started["workflowId"]})
+                    prompt_submission = service.storage.get_prompt_submission_by_operation(str(started["reviewOperationId"]))
+                    return (
+                        started,
+                        active,
+                        repeated,
+                        completed,
+                        fake.review_start_calls,
+                        len(fake.thread_start_calls),
+                        len(fake.turn_start_calls),
+                        prompt_submission,
+                    )
+                finally:
+                    await service.close()
+
+        started, active, repeated, completed, review_calls, thread_starts, turn_starts, prompt_submission = asyncio.run(scenario())
+
+        self.assertEqual("code_review", started["workflowKind"])
+        self.assertEqual("queued", started["phase"])
+        self.assertEqual("review_start", active["reviewOperation"]["operationType"])
+        self.assertEqual("reviewing", active["phase"])
+        self.assertEqual("wait_review", active["nextRecommendedAction"])
+        self.assertEqual("thread-source", active["reviewSourceThreadId"])
+        self.assertEqual("thread-review", active["reviewThreadId"])
+        self.assertEqual("turn-review", active["reviewTurnId"])
+        self.assertEqual("baseBranch", active["reviewTarget"]["type"])
+        self.assertEqual("main", active["reviewTarget"]["branch"])
+        self.assertEqual("detached", active["reviewDelivery"])
+        self.assertTrue(active["reviewOperation"]["reviewState"]["accepted"])
+        self.assertTrue(repeated["idempotent"])
+        self.assertEqual(started["workflowId"], repeated["workflowId"])
+        self.assertEqual(1, len(review_calls))
+        self.assertEqual("thread-source", review_calls[0]["thread_id"])
+        self.assertEqual({"type": "baseBranch", "branch": "main"}, review_calls[0]["target"])
+        self.assertEqual("detached", review_calls[0]["delivery"])
+        self.assertEqual(0, thread_starts)
+        self.assertEqual(0, turn_starts)
+        self.assertIsNone(prompt_submission)
+        self.assertEqual("completed", completed["phase"])
+        self.assertEqual("read_review_report", completed["nextRecommendedAction"])
+        self.assertFalse(completed["pollRecommended"])
+        self.assertEqual("Review report: no issues found.", completed["finalReport"]["text"])
+        self.assertIsNotNone(completed["latestReportHash"])
+        self.assertEqual("completed", completed["reviewOperation"]["status"])
+
+    def test_review_workflow_project_path_starts_source_thread_then_inline_review(self) -> None:
+        async def scenario() -> tuple[dict, list[dict], list[dict]]:
+            with TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                project = root / "Project"
+                project.mkdir()
+                service = ToolService(_search_service_config(root, root / ".codex" / "state_5.sqlite"))
+                fake = FakeAppServer(service.storage, first_message=None)
+                service._app_server = fake  # type: ignore[assignment]
+                try:
+                    started = await service.call(
+                        "codex_start_review_workflow",
+                        {
+                            "project_id": project_id_for_path(str(project)),
+                            "target_type": "uncommitted_changes",
+                            "client_request_id": "review-project-1",
+                        },
+                    )
+                    active = started
+                    for _ in range(50):
+                        active = await service.call("codex_get_workflow_status", {"workflow_id": started["workflowId"]})
+                        if active.get("reviewTurnId"):
+                            break
+                        await asyncio.sleep(0.01)
+                    return active, fake.thread_start_calls, fake.review_start_calls
+                finally:
+                    await service.close()
+
+        active, thread_start_calls, review_start_calls = asyncio.run(scenario())
+
+        self.assertEqual("reviewing", active["phase"])
+        self.assertEqual("thread-new", active["reviewSourceThreadId"])
+        self.assertEqual("thread-new", active["reviewThreadId"])
+        self.assertEqual("turn-review", active["reviewTurnId"])
+        self.assertEqual("inline", active["reviewDelivery"])
+        self.assertEqual(1, len(thread_start_calls))
+        self.assertEqual(1, len(review_start_calls))
+        self.assertEqual("thread-new", review_start_calls[0]["thread_id"])
+        self.assertEqual({"type": "uncommittedChanges"}, review_start_calls[0]["target"])
+        self.assertEqual("inline", review_start_calls[0]["delivery"])
+
+    def test_review_workflow_loads_final_report_from_thread_history(self) -> None:
+        async def scenario() -> dict:
+            with TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                project = root / "Project"
+                project.mkdir()
+                sessions = root / ".codex" / "sessions"
+                sessions.mkdir(parents=True)
+                service = ToolService(_search_service_config(root, root / ".codex" / "state_5.sqlite"))
+                fake = FakeAppServer(service.storage, first_message=None)
+                service._app_server = fake  # type: ignore[assignment]
+                try:
+                    started = await service.call(
+                        "codex_start_review_workflow",
+                        {
+                            "project_id": project_id_for_path(str(project)),
+                            "target_type": "uncommitted_changes",
+                            "client_request_id": "review-history-1",
+                        },
+                    )
+                    active = started
+                    for _ in range(50):
+                        active = await service.call("codex_get_workflow_status", {"workflow_id": started["workflowId"]})
+                        if active.get("reviewTurnId"):
+                            break
+                        await asyncio.sleep(0.01)
+                    self.assertEqual("turn-review", active["reviewTurnId"])
+                    _write_transcript(
+                        sessions / "rollout-review-history.jsonl",
+                        "thread-new",
+                        project,
+                        [
+                            ("user", "Review the current code changes."),
+                            ("assistant", "Review report: no blocking issues."),
+                        ],
+                    )
+                    return await service.call(
+                        "codex_get_workflow_status",
+                        {"workflow_id": started["workflowId"], "last_messages": 5, "message_max_chars": 4000},
+                    )
+                finally:
+                    await service.close()
+
+        completed = asyncio.run(scenario())
+
+        self.assertEqual("completed", completed["phase"])
+        self.assertEqual("read_review_report", completed["nextRecommendedAction"])
+        self.assertEqual("thread-new-turn", completed["reviewTurnId"])
+        self.assertEqual("Review report: no blocking issues.", completed["finalReport"]["text"])
+        self.assertEqual("completed", completed["reviewOperation"]["status"])
+        self.assertEqual("thread-new-turn", completed["reviewOperation"]["turnId"])
+        self.assertEqual("thread-new-turn", completed["reviewOperation"]["reviewState"]["reviewTurnId"])
+        self.assertEqual("completed", completed["reviewTurn"]["status"])
+
+    def test_review_workflow_review_start_error_fails_workflow(self) -> None:
+        async def scenario() -> tuple[dict, dict, list[dict]]:
+            with TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                project = root / "Project"
+                project.mkdir()
+                service = ToolService(_search_service_config(root, root / ".codex" / "state_5.sqlite"))
+                fake = FakeAppServer(service.storage, first_message=None)
+                fake.review_start_failure = RuntimeError("review rejected")
+                service._app_server = fake  # type: ignore[assignment]
+                try:
+                    started = await service.call(
+                        "codex_start_review_workflow",
+                        {
+                            "project_id": project_id_for_path(str(project)),
+                            "target_type": "uncommitted_changes",
+                            "client_request_id": "review-error-1",
+                        },
+                    )
+                    status = started
+                    for _ in range(50):
+                        status = await service.call("codex_get_workflow_status", {"workflow_id": started["workflowId"]})
+                        if status.get("status") == "failed":
+                            break
+                        await asyncio.sleep(0.01)
+                    return started, status, fake.review_start_calls
+                finally:
+                    await service.close()
+
+        started, failed, review_start_calls = asyncio.run(scenario())
+
+        self.assertEqual("code_review", started["workflowKind"])
+        self.assertEqual("failed", failed["phase"])
+        self.assertEqual("failed", failed["status"])
+        self.assertEqual("inspect_diagnostics", failed["nextRecommendedAction"])
+        self.assertIn("review rejected", failed["lastError"])
+        self.assertTrue(failed["reviewOperation"]["reviewState"]["startAttempted"])
+        self.assertEqual(0, len(review_start_calls))
+
+    def test_startup_recovery_marks_attempted_review_start_unknown_without_retry(self) -> None:
+        with TemporaryDirectory() as tmp:
+            storage = McpStorage(Path(tmp) / "mcp.sqlite")
+            storage.connect()
+            try:
+                operation_id = "op-review-attempted"
+                storage.create_operation(
+                    _storage_operation_row(
+                        operation_id,
+                        status="starting_review",
+                        operation_type="review_start",
+                        request={
+                            "operation_type": "review_start",
+                            "workflow_id": "wf-review-attempted",
+                            "_review_start_attempted": True,
+                            "_review_source_thread_id": "thread-source",
+                            "_operation_id": operation_id,
+                        },
+                    )
+                )
+                recovered = storage.recover_startup_operations(now="2026-05-25T00:05:00+00:00")
+                stored = storage.get_operation(operation_id) or {}
+            finally:
+                storage.close()
+
+        self.assertEqual([operation_id], recovered["unknownOperationIds"])
+        self.assertEqual("unknown_after_app_server_exit", stored["status"])
+        self.assertIn("review/start attempt", stored["last_error"])
+
+    def test_plan_workflow_goal_sets_once_and_clears_on_completion(self) -> None:
+        async def scenario() -> tuple[dict, dict, dict, dict, int, int, int]:
+            with TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                project = root / "Project"
+                project.mkdir()
+                config = _search_service_config(root, root / ".codex" / "state_5.sqlite")
+                service = ToolService(config)
+                fake = FakeAppServer(service.storage, first_message=None)
+                service._app_server = fake  # type: ignore[assignment]
+                project_id = project_id_for_path(str(project))
+                try:
+                    started = await service.codex_start_plan_workflow(
+                        {
+                            "project_id": project_id,
+                            "message": "prepare a plan",
+                            "client_request_id": "workflow-goal-start",
+                            "goal": "Ship the workflow goal sync smoke",
+                            "goal_token_budget": 1234,
+                            "first_message_timeout_seconds": 1,
+                        }
+                    )
+                    active = started
+                    for _ in range(50):
+                        active = await service.call("codex_get_workflow_status", {"workflow_id": started["workflowId"]})
+                        if active["threadId"] and active["threadGoal"]["syncState"] == "active":
+                            break
+                        await asyncio.sleep(0.01)
+                    repeated_active = await service.call("codex_get_workflow_status", {"workflow_id": started["workflowId"]})
+                    service.storage.upsert_tracked_plan_item(
+                        {
+                            "item_id": "plan-goal-1",
+                            "turn_id": active["planTurnId"],
+                            "thread_id": active["threadId"],
+                            "status": "completed",
+                            "text": "Workflow plan",
+                            "created_at": "2026-05-25T00:00:00+00:00",
+                            "updated_at": "2026-05-25T00:00:01+00:00",
+                            "completed_at": "2026-05-25T00:00:01+00:00",
+                            "sequence": 1,
+                            "payload_json": "{}",
+                        }
+                    )
+                    service.storage.update_tracked_turn_status(
+                        active["planTurnId"],
+                        status="completed",
+                        updated_at="2026-05-25T00:00:02+00:00",
+                        completed_at="2026-05-25T00:00:02+00:00",
+                    )
+                    service.codex_approve_plan(
+                        {
+                            "workflow_id": started["workflowId"],
+                            "client_request_id": "workflow-goal-execute",
+                        }
+                    )
+                    executing = active
+                    for _ in range(50):
+                        executing = await service.call("codex_get_workflow_status", {"workflow_id": started["workflowId"]})
+                        if executing["executionTurnId"]:
+                            break
+                        await asyncio.sleep(0.01)
+                    service.storage.update_tracked_turn_status(
+                        executing["executionTurnId"],
+                        status="completed",
+                        updated_at="2026-05-25T00:00:04+00:00",
+                        completed_at="2026-05-25T00:00:04+00:00",
+                        final_message="Final workflow report",
+                    )
+                    completed = await service.call("codex_get_workflow_status", {"workflow_id": started["workflowId"]})
+                    return (
+                        started,
+                        active,
+                        repeated_active,
+                        completed,
+                        len(fake.thread_goal_set_calls),
+                        len(fake.thread_goal_get_calls),
+                        len(fake.thread_goal_clear_calls),
+                    )
+                finally:
+                    await service.close()
+
+        started, active, repeated_active, completed, set_count, get_count, clear_count = asyncio.run(scenario())
+
+        self.assertEqual("pending_thread", started["threadGoal"]["syncState"])
+        self.assertEqual("active", active["threadGoal"]["syncState"])
+        self.assertEqual("Ship the workflow goal sync smoke", active["threadGoal"]["currentGoal"]["objective"])
+        self.assertEqual(1234, active["threadGoal"]["currentGoal"]["tokenBudget"])
+        self.assertEqual("active", repeated_active["threadGoal"]["syncState"])
+        self.assertEqual(1, set_count)
+        self.assertGreaterEqual(get_count, 1)
+        self.assertEqual(1, clear_count)
+        self.assertEqual("completed", completed["phase"])
+        self.assertEqual("cleared", completed["threadGoal"]["syncState"])
+        self.assertIsNone(completed["threadGoal"]["currentGoal"])
+
+    def test_plan_workflow_without_goal_does_not_set_app_server_goal(self) -> None:
+        async def scenario() -> tuple[dict, int]:
+            with TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                project = root / "Project"
+                project.mkdir()
+                service = ToolService(_search_service_config(root, root / ".codex" / "state_5.sqlite"))
+                fake = FakeAppServer(service.storage, first_message=None)
+                service._app_server = fake  # type: ignore[assignment]
+                try:
+                    started = await service.codex_start_plan_workflow(
+                        {
+                            "project_id": project_id_for_path(str(project)),
+                            "message": "prepare a plan without goal",
+                            "client_request_id": "workflow-no-goal-start",
+                            "first_message_timeout_seconds": 1,
+                        }
+                    )
+                    status = started
+                    for _ in range(50):
+                        status = await service.call("codex_get_workflow_status", {"workflow_id": started["workflowId"]})
+                        if status["threadId"]:
+                            break
+                        await asyncio.sleep(0.01)
+                    return status, len(fake.thread_goal_set_calls)
+                finally:
+                    await service.close()
+
+        status, set_count = asyncio.run(scenario())
+
+        self.assertFalse(status["threadGoal"]["configured"])
+        self.assertEqual("not_configured", status["threadGoal"]["syncState"])
+        self.assertEqual(0, set_count)
+
+    def test_plan_workflow_goal_unsupported_does_not_fail_status(self) -> None:
+        async def scenario() -> tuple[dict, int]:
+            with TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                project = root / "Project"
+                project.mkdir()
+                service = ToolService(_search_service_config(root, root / ".codex" / "state_5.sqlite"))
+                fake = FakeAppServer(service.storage, first_message=None)
+                fake.thread_goal_failures["set"] = RuntimeError("Method not found: thread/goal/set")
+                service._app_server = fake  # type: ignore[assignment]
+                try:
+                    started = await service.codex_start_plan_workflow(
+                        {
+                            "project_id": project_id_for_path(str(project)),
+                            "message": "prepare a plan",
+                            "client_request_id": "workflow-goal-unsupported",
+                            "goal": "Unsupported goal should not fail workflow",
+                            "first_message_timeout_seconds": 1,
+                        }
+                    )
+                    status = started
+                    for _ in range(50):
+                        status = await service.call("codex_get_workflow_status", {"workflow_id": started["workflowId"]})
+                        if status["threadGoal"]["syncState"] == "unsupported":
+                            break
+                        await asyncio.sleep(0.01)
+                    return status, len(fake.thread_goal_set_calls)
+                finally:
+                    await service.close()
+
+        status, set_count = asyncio.run(scenario())
+
+        self.assertTrue(status["ok"])
+        self.assertEqual("unsupported", status["threadGoal"]["syncState"])
+        self.assertFalse(status["threadGoal"]["available"])
+        self.assertEqual(1, set_count)
+
+    def test_plan_workflow_goal_error_observes_existing_goal_without_second_set(self) -> None:
+        async def scenario() -> tuple[dict, int, int]:
+            with TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                project = root / "Project"
+                project.mkdir()
+                service = ToolService(_search_service_config(root, root / ".codex" / "state_5.sqlite"))
+                fake = FakeAppServer(service.storage, first_message=None)
+                fake.thread_goal_failures["set"] = RuntimeError("temporary goal set timeout")
+                service._app_server = fake  # type: ignore[assignment]
+                try:
+                    started = await service.codex_start_plan_workflow(
+                        {
+                            "project_id": project_id_for_path(str(project)),
+                            "message": "prepare a plan",
+                            "client_request_id": "workflow-goal-transient-error",
+                            "goal": "Recover goal after timeout",
+                            "goal_token_budget": 4321,
+                            "first_message_timeout_seconds": 1,
+                        }
+                    )
+                    errored = started
+                    for _ in range(50):
+                        errored = await service.call("codex_get_workflow_status", {"workflow_id": started["workflowId"]})
+                        if errored["threadGoal"]["syncState"] == "error":
+                            break
+                        await asyncio.sleep(0.01)
+                    thread_id = errored["threadId"]
+                    fake.thread_goal_failures.pop("set", None)
+                    fake.thread_goals[thread_id] = {
+                        "threadId": thread_id,
+                        "objective": "Recover goal after timeout",
+                        "status": "active",
+                        "tokenBudget": 4321,
+                    }
+                    recovered = await service.call("codex_get_workflow_status", {"workflow_id": started["workflowId"]})
+                    return recovered, len(fake.thread_goal_set_calls), len(fake.thread_goal_get_calls)
+                finally:
+                    await service.close()
+
+        status, set_count, get_count = asyncio.run(scenario())
+
+        self.assertEqual("active", status["threadGoal"]["syncState"])
+        self.assertIsNone(status["threadGoal"]["lastError"])
+        self.assertEqual(1, set_count)
+        self.assertGreaterEqual(get_count, 1)
+
+    def test_completed_workflow_goal_set_complete_and_external_override(self) -> None:
+        async def scenario() -> tuple[dict, list[dict], dict, int]:
+            with TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                project = root / "Project"
+                project.mkdir()
+                service = ToolService(_search_service_config(root, root / ".codex" / "state_5.sqlite"))
+                fake = FakeAppServer(service.storage, first_message=None)
+                service._app_server = fake  # type: ignore[assignment]
+                project_id = project_id_for_path(str(project))
+                try:
+                    complete_started = await service.codex_start_plan_workflow(
+                        {
+                            "project_id": project_id,
+                            "message": "prepare a complete-goal plan",
+                            "client_request_id": "workflow-goal-complete-start",
+                            "goal": "Run a goal to completion",
+                            "goal_completion_action": "set_complete",
+                            "goal_completion_objective": "Goal completed by MCP",
+                            "first_message_timeout_seconds": 1,
+                        }
+                    )
+                    complete_active = complete_started
+                    for _ in range(50):
+                        complete_active = await service.call("codex_get_workflow_status", {"workflow_id": complete_started["workflowId"]})
+                        if complete_active["threadGoal"]["syncState"] == "active":
+                            break
+                        await asyncio.sleep(0.01)
+                    service.storage.upsert_tracked_plan_item(
+                        {
+                            "item_id": "plan-goal-complete",
+                            "turn_id": complete_active["planTurnId"],
+                            "thread_id": complete_active["threadId"],
+                            "status": "completed",
+                            "text": "Workflow plan",
+                            "created_at": "2026-05-25T00:00:00+00:00",
+                            "updated_at": "2026-05-25T00:00:01+00:00",
+                            "completed_at": "2026-05-25T00:00:01+00:00",
+                            "sequence": 1,
+                            "payload_json": "{}",
+                        }
+                    )
+                    service.storage.update_tracked_turn_status(
+                        complete_active["planTurnId"],
+                        status="completed",
+                        updated_at="2026-05-25T00:00:02+00:00",
+                        completed_at="2026-05-25T00:00:02+00:00",
+                    )
+                    service.codex_approve_plan({"workflow_id": complete_started["workflowId"], "client_request_id": "workflow-goal-complete-exec"})
+                    complete_executing = complete_active
+                    for _ in range(50):
+                        complete_executing = await service.call("codex_get_workflow_status", {"workflow_id": complete_started["workflowId"]})
+                        if complete_executing["executionTurnId"]:
+                            break
+                        await asyncio.sleep(0.01)
+                    service.storage.update_tracked_turn_status(
+                        complete_executing["executionTurnId"],
+                        status="completed",
+                        updated_at="2026-05-25T00:00:04+00:00",
+                        completed_at="2026-05-25T00:00:04+00:00",
+                        final_message="Final workflow report",
+                    )
+                    complete_done = await service.call("codex_get_workflow_status", {"workflow_id": complete_started["workflowId"]})
+
+                    override_started = await service.codex_start_plan_workflow(
+                        {
+                            "project_id": project_id,
+                            "message": "prepare an override plan",
+                            "client_request_id": "workflow-goal-override-start",
+                            "goal": "Managed goal before override",
+                            "first_message_timeout_seconds": 1,
+                        }
+                    )
+                    override_active = override_started
+                    for _ in range(50):
+                        override_active = await service.call("codex_get_workflow_status", {"workflow_id": override_started["workflowId"]})
+                        if override_active["threadGoal"]["syncState"] == "active":
+                            break
+                        await asyncio.sleep(0.01)
+                    fake.thread_goals[override_active["threadId"]]["objective"] = "External goal override"
+                    override_status = await service.call("codex_get_workflow_status", {"workflow_id": override_started["workflowId"]})
+                    return complete_done, fake.thread_goal_set_calls, override_status, len(fake.thread_goal_clear_calls)
+                finally:
+                    await service.close()
+
+        complete_done, set_calls, override_status, clear_count = asyncio.run(scenario())
+
+        self.assertEqual("complete", complete_done["threadGoal"]["syncState"])
+        self.assertEqual("complete", complete_done["threadGoal"]["currentGoal"]["status"])
+        self.assertEqual("Goal completed by MCP", complete_done["threadGoal"]["currentGoal"]["objective"])
+        self.assertTrue(any(call["status"] == "complete" for call in set_calls))
+        self.assertEqual("external_override", override_status["threadGoal"]["syncState"])
+        self.assertEqual("External goal override", override_status["threadGoal"]["currentGoal"]["objective"])
+        self.assertEqual(0, clear_count)
+
+    def test_approve_plan_output_schema_persists_structured_workflow_report(self) -> None:
+        async def scenario() -> tuple[dict, list[dict], dict]:
+            with TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                project = root / "Project"
+                project.mkdir()
+                state_db = root / ".codex" / "state_5.sqlite"
+                service = ToolService(_search_service_config(root, state_db))
+                fake = FakeAppServer(service.storage, first_message=None)
+                service._app_server = fake  # type: ignore[assignment]
+                project_id = project_id_for_path(str(project))
+                schema = {
+                    "type": "object",
+                    "required": ["summary", "risk"],
+                    "additionalProperties": False,
+                    "properties": {
+                        "summary": {"type": "string"},
+                        "risk": {"type": "string"},
+                    },
+                }
+                try:
+                    started = await service.codex_start_plan_workflow(
+                        {
+                            "project_id": project_id,
+                            "message": "prepare a plan",
+                            "client_request_id": "workflow-output-schema-start",
+                            "first_message_timeout_seconds": 1,
+                        }
+                    )
+                    for _ in range(50):
+                        planning = service.codex_get_workflow_status({"workflow_id": started["workflowId"]})
+                        if planning["planTurnId"]:
+                            break
+                        await asyncio.sleep(0.01)
+                    else:
+                        self.fail("Plan operation did not produce planTurnId")
+                    service.storage.upsert_tracked_plan_item(
+                        {
+                            "item_id": "plan-schema-1",
+                            "turn_id": planning["planTurnId"],
+                            "thread_id": planning["threadId"],
+                            "status": "completed",
+                            "text": "Workflow plan",
+                            "created_at": "2026-05-25T00:00:00+00:00",
+                            "updated_at": "2026-05-25T00:00:01+00:00",
+                            "completed_at": "2026-05-25T00:00:01+00:00",
+                            "sequence": 1,
+                            "payload_json": "{}",
+                        }
+                    )
+                    service.storage.update_tracked_turn_status(
+                        planning["planTurnId"],
+                        status="completed",
+                        updated_at="2026-05-25T00:00:02+00:00",
+                        completed_at="2026-05-25T00:00:02+00:00",
+                    )
+                    approved = service.codex_approve_plan(
+                        {
+                            "workflow_id": started["workflowId"],
+                            "client_request_id": "workflow-output-schema-execute",
+                            "output_schema": schema,
+                        }
+                    )
+                    for _ in range(50):
+                        executing = service.codex_get_workflow_status({"workflow_id": started["workflowId"]})
+                        if executing["executionTurnId"]:
+                            break
+                        await asyncio.sleep(0.01)
+                    else:
+                        self.fail("Execution operation did not produce executionTurnId")
+                    final_json = json.dumps({"summary": "Implemented", "risk": "low"})
+                    service.storage.update_tracked_turn_status(
+                        executing["executionTurnId"],
+                        status="completed",
+                        updated_at="2026-05-25T00:00:04+00:00",
+                        completed_at="2026-05-25T00:00:04+00:00",
+                        final_message=final_json,
+                    )
+                    completed = service.codex_get_workflow_status({"workflow_id": started["workflowId"]})
+                    return approved, fake.turn_start_calls, completed
+                finally:
+                    await service.close()
+
+        approved, turn_start_calls, completed = asyncio.run(scenario())
+
+        self.assertIsNotNone(approved["executionOperationId"])
+        self.assertIsNone(turn_start_calls[0].get("output_schema"))
+        self.assertEqual("object", turn_start_calls[1]["output_schema"]["type"])
+        self.assertEqual("completed", completed["phase"])
+        self.assertEqual("Implemented", completed["finalReport"]["structured"]["summary"])
+        self.assertEqual("low", completed["finalReport"]["structured"]["risk"])
+        self.assertEqual("parsed", completed["finalReport"]["structuredStatus"])
+        self.assertEqual("valid_json", completed["executionOperation"]["outputSchemaState"]["parseStatus"])
+        self.assertEqual(completed["latestReportHash"], completed["executionOperation"]["latestReportHash"])
 
     def test_workflow_status_surfaces_pending_interactions_and_orphaned_turn(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -2861,6 +4056,373 @@ class McpDefinitionTests(unittest.TestCase):
         self.assertFalse(completed["pollRecommended"])
         self.assertEqual("completed", stored["status"])
 
+    def test_submit_task_output_schema_passes_to_turn_start_and_persists_structured_report(self) -> None:
+        async def scenario() -> tuple[dict, dict, dict, list[dict], dict]:
+            with TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                project = root / "Project"
+                project.mkdir()
+                state_db = root / ".codex" / "state_5.sqlite"
+                service = ToolService(_search_service_config(root, state_db))
+                fake = FakeAppServer(service.storage, first_message=None)
+                service._app_server = fake  # type: ignore[assignment]
+                project_id = project_id_for_path(str(project))
+                schema = {
+                    "type": "object",
+                    "required": ["summary", "status"],
+                    "additionalProperties": False,
+                    "properties": {
+                        "summary": {"type": "string"},
+                        "status": {"type": "string"},
+                    },
+                }
+                try:
+                    submitted = await service.call(
+                        "codex_submit_task",
+                        {
+                            "operation_type": "start_chat",
+                            "project_id": project_id,
+                            "message": "Return a structured final report.",
+                            "client_request_id": "operation-output-schema-1",
+                            "output_schema": schema,
+                        },
+                    )
+                    running = submitted
+                    for _ in range(50):
+                        running = service.codex_get_operation_status({"operation_id": submitted["operationId"]})
+                        if running.get("turnId"):
+                            break
+                        await asyncio.sleep(0.01)
+                    final_json = json.dumps({"summary": "Done", "status": "ok"})
+                    service.storage.update_tracked_turn_status(
+                        running["turnId"],
+                        status="completed",
+                        updated_at="2026-05-25T00:00:04+00:00",
+                        completed_at="2026-05-25T00:00:04+00:00",
+                        final_message=final_json,
+                    )
+                    completed = service.codex_get_operation_status({"operation_id": submitted["operationId"]})
+                    stored = service.storage.get_operation(str(submitted["operationId"])) or {}
+                    return submitted, running, completed, fake.turn_start_calls, stored
+                finally:
+                    await service.close()
+
+        submitted, running, completed, calls, stored = asyncio.run(scenario())
+
+        self.assertEqual("operation-output-schema-1", submitted["clientRequestId"])
+        self.assertEqual("running", running["status"])
+        self.assertEqual(1, len(calls))
+        self.assertEqual("object", calls[0]["output_schema"]["type"])
+        self.assertIn("outputSchemaState", running)
+        self.assertEqual(running["outputSchemaState"]["schemaHash"], running["request"]["output_schema_hash"])
+        self.assertNotIn("output_schema", running["request"])
+        self.assertEqual("completed", completed["status"])
+        self.assertEqual("Done", completed["finalReport"]["structured"]["summary"])
+        self.assertEqual("ok", completed["finalReport"]["structured"]["status"])
+        self.assertEqual("parsed", completed["finalReport"]["structuredStatus"])
+        self.assertEqual("valid_json", completed["finalReport"]["structuredParseStatus"])
+        self.assertEqual("valid_json", completed["outputSchemaState"]["parseStatus"])
+        self.assertEqual(completed["latestReportHash"], stored["latest_report_hash"])
+        self.assertIsNotNone(stored["final_report_json"])
+
+    def test_submit_task_output_schema_rejects_invalid_schema_before_app_server_call(self) -> None:
+        async def scenario() -> tuple[dict, int]:
+            with TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                project = root / "Project"
+                project.mkdir()
+                state_db = root / ".codex" / "state_5.sqlite"
+                service = ToolService(_search_service_config(root, state_db))
+                fake = FakeAppServer(service.storage, first_message=None)
+                service._app_server = fake  # type: ignore[assignment]
+                try:
+                    result = await service.call(
+                        "codex_submit_task",
+                        {
+                            "operation_type": "start_chat",
+                            "project_id": project_id_for_path(str(project)),
+                            "message": "invalid schema",
+                            "output_schema": {"type": "unsupported"},
+                        },
+                    )
+                    return result, len(fake.turn_start_calls)
+                finally:
+                    await service.close()
+
+        result, call_count = asyncio.run(scenario())
+
+        self.assertEqual("INVALID_ARGUMENT", result["error"]["code"])
+        self.assertEqual(0, call_count)
+
+    def test_submit_task_image_inputs_pass_to_turn_start_and_status_is_safe(self) -> None:
+        async def scenario() -> tuple[dict, dict, list[dict]]:
+            with TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                project = root / "Project"
+                project.mkdir()
+                image = project / "screenshot.png"
+                image.write_bytes(b"\x89PNG\r\n\x1a\n")
+                state_db = root / ".codex" / "state_5.sqlite"
+                service = ToolService(_search_service_config(root, state_db))
+                fake = FakeAppServer(service.storage, first_message="image first")
+                service._app_server = fake  # type: ignore[assignment]
+                project_id = project_id_for_path(str(project))
+                try:
+                    submitted = await service.call(
+                        "codex_submit_task",
+                        {
+                            "operation_type": "start_chat",
+                            "project_id": project_id,
+                            "cwd": str(project),
+                            "message": "Analyze the attached screenshot.",
+                            "input_items": [
+                                {"type": "localImage", "path": "screenshot.png", "detail": "low"},
+                                {
+                                    "type": "image",
+                                    "url": "https://example.com/private/screenshot.png?token=secret",
+                                    "detail": "high",
+                                },
+                            ],
+                        },
+                    )
+                    running = submitted
+                    for _ in range(50):
+                        running = service.codex_get_operation_status({"operation_id": submitted["operationId"]})
+                        if running.get("turnId"):
+                            break
+                        await asyncio.sleep(0.01)
+                    return submitted, running, fake.turn_start_calls
+                finally:
+                    await service.close()
+
+        submitted, running, calls = asyncio.run(scenario())
+
+        self.assertIn("operationId", submitted)
+        self.assertEqual("running", running["status"])
+        self.assertEqual(1, len(calls))
+        sent_items = calls[0]["input_items"]
+        self.assertEqual("text", sent_items[0]["type"])
+        self.assertEqual("localImage", sent_items[1]["type"])
+        self.assertTrue(Path(sent_items[1]["path"]).is_absolute())
+        self.assertEqual("image", sent_items[2]["type"])
+        self.assertEqual("https://example.com/private/screenshot.png?token=secret", sent_items[2]["url"])
+        state = running["inputItemState"]
+        self.assertEqual(2, state["count"])
+        self.assertEqual(1, state["localImageCount"])
+        self.assertEqual(1, state["imageUrlCount"])
+        self.assertIn("dedupHash", state)
+        rendered = json.dumps(running, ensure_ascii=False)
+        self.assertNotIn("https://example.com/private/screenshot.png?token=secret", rendered)
+        self.assertNotIn("screenshot.png", rendered)
+        self.assertNotIn("input_items", running["request"])
+        self.assertNotIn("_input_items", running["request"])
+
+    def test_submit_task_image_inputs_validate_paths_urls_and_operation_types(self) -> None:
+        async def scenario() -> tuple[dict, dict, dict, dict, dict, dict, dict, int]:
+            with TemporaryDirectory() as tmp, TemporaryDirectory() as outside_tmp:
+                root = Path(tmp)
+                project = root / "Project"
+                project.mkdir()
+                outside = Path(outside_tmp) / "outside.png"
+                outside.write_bytes(b"\x89PNG\r\n\x1a\n")
+                bad_extension = project / "note.txt"
+                bad_extension.write_text("not an image", encoding="utf-8")
+                tiny = project / "tiny.png"
+                tiny.write_bytes(b"\x89PNG\r\n\x1a\n")
+                config = _search_service_config(root, root / ".codex" / "state_5.sqlite")
+                config.max_image_input_bytes = 4
+                service = ToolService(config)
+                fake = FakeAppServer(service.storage, first_message=None)
+                service._app_server = fake  # type: ignore[assignment]
+                project_id = project_id_for_path(str(project))
+                try:
+                    base = {
+                        "operation_type": "start_chat",
+                        "project_id": project_id,
+                        "cwd": str(project),
+                        "message": "Analyze image.",
+                    }
+                    missing = await service.call(
+                        "codex_submit_task",
+                        {**base, "input_items": [{"type": "localImage", "path": "missing.png"}]},
+                    )
+                    outside_result = await service.call(
+                        "codex_submit_task",
+                        {**base, "input_items": [{"type": "localImage", "path": str(outside)}]},
+                    )
+                    bad_ext = await service.call(
+                        "codex_submit_task",
+                        {**base, "input_items": [{"type": "localImage", "path": str(bad_extension)}]},
+                    )
+                    too_large = await service.call(
+                        "codex_submit_task",
+                        {**base, "input_items": [{"type": "localImage", "path": str(tiny)}]},
+                    )
+                    bad_url = await service.call(
+                        "codex_submit_task",
+                        {**base, "input_items": [{"type": "image", "url": "data:image/png;base64,AAAA"}]},
+                    )
+                    steer = await service.call(
+                        "codex_submit_task",
+                        {
+                            "operation_type": "steer_turn",
+                            "thread_id": "thread-active",
+                            "expected_turn_id": "turn-active",
+                            "message": "look at this",
+                            "input_items": [{"type": "image", "url": "https://example.com/a.png"}],
+                        },
+                    )
+                    fork_only = await service.call(
+                        "codex_submit_task",
+                        {
+                            "operation_type": "fork_thread",
+                            "source_thread_id": "thread-source",
+                            "input_items": [{"type": "image", "url": "https://example.com/a.png"}],
+                        },
+                    )
+                    return missing, outside_result, bad_ext, too_large, bad_url, steer, fork_only, len(fake.turn_start_calls)
+                finally:
+                    await service.close()
+
+        missing, outside_result, bad_ext, too_large, bad_url, steer, fork_only, call_count = asyncio.run(scenario())
+
+        for item in (missing, outside_result, bad_ext, too_large, bad_url, steer, fork_only):
+            self.assertEqual("INVALID_ARGUMENT", item["error"]["code"])
+        self.assertEqual(0, call_count)
+
+    def test_submit_task_image_dedup_uses_image_descriptor(self) -> None:
+        async def scenario() -> tuple[dict, dict, dict]:
+            with TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                project = root / "Project"
+                project.mkdir()
+                service = ToolService(_search_service_config(root, root / ".codex" / "state_5.sqlite"))
+                fake = FakeAppServer(service.storage, first_message="image dedup first")
+                service._app_server = fake  # type: ignore[assignment]
+                project_id = project_id_for_path(str(project))
+                try:
+                    base = {
+                        "operation_type": "start_chat",
+                        "project_id": project_id,
+                        "message": "Investigate duplicate prompt protection with image evidence.",
+                    }
+                    first = await service.call(
+                        "codex_submit_task",
+                        {**base, "input_items": [{"type": "image", "url": "https://example.com/a.png"}]},
+                    )
+                    duplicate = await service.call(
+                        "codex_submit_task",
+                        {**base, "input_items": [{"type": "image", "url": "https://example.com/a.png"}]},
+                    )
+                    different = await service.call(
+                        "codex_submit_task",
+                        {**base, "input_items": [{"type": "image", "url": "https://example.com/b.png"}]},
+                    )
+                    return first, duplicate, different
+                finally:
+                    await service.close()
+
+        first, duplicate, different = asyncio.run(scenario())
+
+        self.assertIn("operationId", first)
+        self.assertEqual("CODEX_DUPLICATE_PROMPT_ACTIVE", duplicate["error"]["code"])
+        self.assertIn("operationId", different)
+        self.assertNotEqual(first["operationId"], different["operationId"])
+
+    def test_redact_payload_redacts_image_url_and_local_path(self) -> None:
+        payload = {
+            "input": [
+                {"type": "image", "url": "https://example.com/private.png?token=secret", "detail": "high"},
+                {"type": "localImage", "path": r"C:\Secret\screenshot.png", "detail": "low"},
+            ]
+        }
+
+        redacted = redact_payload(payload)
+        rendered = json.dumps(redacted, ensure_ascii=False)
+
+        self.assertNotIn("https://example.com/private.png?token=secret", rendered)
+        self.assertNotIn(r"C:\Secret\screenshot.png", rendered)
+        self.assertIn("[redacted-image-url]", rendered)
+        self.assertIn("[redacted-local-image-path]", rendered)
+
+    def test_submit_task_output_schema_requires_strict_object_schema(self) -> None:
+        async def scenario() -> tuple[dict, int]:
+            with TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                project = root / "Project"
+                project.mkdir()
+                state_db = root / ".codex" / "state_5.sqlite"
+                service = ToolService(_search_service_config(root, state_db))
+                fake = FakeAppServer(service.storage, first_message=None)
+                service._app_server = fake  # type: ignore[assignment]
+                try:
+                    result = await service.call(
+                        "codex_submit_task",
+                        {
+                            "operation_type": "start_chat",
+                            "project_id": project_id_for_path(str(project)),
+                            "message": "schema missing additionalProperties false",
+                            "output_schema": {
+                                "type": "object",
+                                "required": ["summary"],
+                                "properties": {"summary": {"type": "string"}},
+                            },
+                        },
+                    )
+                    return result, len(fake.turn_start_calls)
+                finally:
+                    await service.close()
+
+        result, call_count = asyncio.run(scenario())
+
+        self.assertEqual("INVALID_ARGUMENT", result["error"]["code"])
+        self.assertEqual("$", result["error"]["details"]["path"])
+        self.assertEqual(0, call_count)
+
+    def test_submit_task_plain_final_report_remains_readable_without_structured_payload(self) -> None:
+        async def scenario() -> dict:
+            with TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                project = root / "Project"
+                project.mkdir()
+                state_db = root / ".codex" / "state_5.sqlite"
+                service = ToolService(_search_service_config(root, state_db))
+                service._app_server = FakeAppServer(service.storage, first_message=None)  # type: ignore[assignment]
+                try:
+                    submitted = await service.call(
+                        "codex_submit_task",
+                        {
+                            "operation_type": "start_chat",
+                            "project_id": project_id_for_path(str(project)),
+                            "message": "Return a plain final report.",
+                            "client_request_id": "operation-plain-report-1",
+                        },
+                    )
+                    running = submitted
+                    for _ in range(50):
+                        running = service.codex_get_operation_status({"operation_id": submitted["operationId"]})
+                        if running.get("turnId"):
+                            break
+                        await asyncio.sleep(0.01)
+                    service.storage.update_tracked_turn_status(
+                        running["turnId"],
+                        status="completed",
+                        updated_at="2026-05-25T00:00:04+00:00",
+                        completed_at="2026-05-25T00:00:04+00:00",
+                        final_message="Plain final report",
+                    )
+                    return service.codex_get_operation_status({"operation_id": submitted["operationId"]})
+                finally:
+                    await service.close()
+
+        completed = asyncio.run(scenario())
+
+        self.assertEqual("completed", completed["status"])
+        self.assertEqual("Plain final report", completed["finalReport"]["text"])
+        self.assertIsNone(completed["finalReport"]["structured"])
+        self.assertEqual("not_available", completed["finalReport"]["structuredStatus"])
+        self.assertEqual("plain_text", completed["finalReport"]["structuredParseStatus"])
+
     def test_submit_task_rejects_active_duplicate_prompt_in_project(self) -> None:
         async def scenario() -> tuple[dict, dict, int]:
             with TemporaryDirectory() as tmp:
@@ -3125,6 +4687,290 @@ class McpDefinitionTests(unittest.TestCase):
         self.assertEqual("turn-existing", status["turnId"])
         self.assertEqual(0, turn_starts)
 
+    def test_submit_task_fork_thread_validates_runtime_arguments(self) -> None:
+        async def scenario() -> tuple[dict, dict, dict]:
+            with TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                project = root / "Project"
+                project.mkdir()
+                service = ToolService(_search_service_config(root, root / ".codex" / "state_5.sqlite"))
+                try:
+                    missing_message = await service.call(
+                        "codex_submit_task",
+                        {"operation_type": "start_chat", "project_id": project_id_for_path(str(project))},
+                    )
+                    missing_source = await service.call("codex_submit_task", {"operation_type": "fork_thread"})
+                    unknown_source = await service.call(
+                        "codex_submit_task",
+                        {"operation_type": "fork_thread", "source_thread_id": "thread-missing"},
+                    )
+                    return missing_message, missing_source, unknown_source
+                finally:
+                    await service.close()
+
+        missing_message, missing_source, unknown_source = asyncio.run(scenario())
+
+        self.assertEqual("INVALID_ARGUMENT", missing_message["error"]["code"])
+        self.assertEqual("INVALID_ARGUMENT", missing_source["error"]["code"])
+        self.assertEqual("CODEX_THREAD_NOT_FOUND", unknown_source["error"]["code"])
+
+    def test_submit_task_fork_thread_only_is_durable_idempotent(self) -> None:
+        async def scenario() -> tuple[dict, dict, dict, list[dict], int, object]:
+            with TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                project = root / "Project"
+                project.mkdir()
+                sessions = root / ".codex" / "sessions"
+                sessions.mkdir(parents=True)
+                transcript = sessions / "rollout-source.jsonl"
+                _write_transcript(transcript, "thread-source", project, [("user", "source request")])
+                state_db = root / ".codex" / "state_5.sqlite"
+                _create_threads_db(
+                    state_db,
+                    [
+                        {
+                            "id": "thread-source",
+                            "rollout_path": str(transcript),
+                            "cwd": str(project),
+                            "title": "Source",
+                            "preview": "",
+                            "created_at_ms": 1779667200000,
+                            "updated_at_ms": 1779667200000,
+                            "archived": 0,
+                        }
+                    ],
+                )
+                service = ToolService(_search_service_config(root, state_db))
+                fake = FakeAppServer(service.storage, first_message=None)
+                service._app_server = fake  # type: ignore[assignment]
+                try:
+                    submitted = await service.call(
+                        "codex_submit_task",
+                        {
+                            "operation_type": "fork_thread",
+                            "source_thread_id": "thread-source",
+                            "client_request_id": "fork-only-client-1",
+                        },
+                    )
+                    completed = submitted
+                    for _ in range(50):
+                        completed = service.codex_get_operation_status({"operation_id": submitted["operationId"]})
+                        if completed.get("status") == "completed":
+                            break
+                        await asyncio.sleep(0.01)
+                    repeated = await service.call(
+                        "codex_submit_task",
+                        {
+                            "operation_type": "fork_thread",
+                            "source_thread_id": "thread-source",
+                            "client_request_id": "fork-only-client-1",
+                        },
+                    )
+                    prompt_submission = service.storage.get_prompt_submission_by_operation(str(submitted["operationId"]))
+                    return submitted, completed, repeated, fake.thread_fork_calls, len(fake.turn_start_calls), prompt_submission
+                finally:
+                    await service.close()
+
+        submitted, completed, repeated, fork_calls, turn_start_count, prompt_submission = asyncio.run(scenario())
+
+        self.assertEqual("fork_thread", submitted["operationType"])
+        self.assertEqual("completed", completed["status"])
+        self.assertEqual("read_forked_thread", completed["nextRecommendedAction"])
+        self.assertEqual("thread-fork", completed["threadId"])
+        self.assertIsNone(completed["turnId"])
+        self.assertTrue(completed["forkState"]["accepted"])
+        self.assertEqual("thread-source", completed["forkState"]["sourceThreadId"])
+        self.assertEqual("thread-fork", completed["forkState"]["forkedThreadId"])
+        self.assertFalse(completed["forkState"]["hasInitialMessage"])
+        self.assertEqual("not_recorded", completed["dedupState"]["state"])
+        self.assertTrue(repeated["idempotent"])
+        self.assertEqual(submitted["operationId"], repeated["operationId"])
+        self.assertEqual(1, len(fork_calls))
+        self.assertEqual(0, turn_start_count)
+        self.assertIsNone(prompt_submission)
+
+    def test_submit_task_fork_thread_without_client_request_id_creates_new_forks(self) -> None:
+        async def scenario() -> tuple[dict, dict, list[dict]]:
+            with TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                project = root / "Project"
+                project.mkdir()
+                service = ToolService(_search_service_config(root, root / ".codex" / "state_5.sqlite"))
+                fake = FakeAppServer(service.storage, first_message=None)
+                service._app_server = fake  # type: ignore[assignment]
+                try:
+                    fake.tracker.register_turn(
+                        turn_id="turn-source",
+                        thread_id="thread-source",
+                        chat_id="thread-source",
+                        project_id=project_id_for_path(str(project)),
+                        project_path=str(project),
+                    )
+                    first = await service.call(
+                        "codex_submit_task",
+                        {"operation_type": "fork_thread", "source_thread_id": "thread-source"},
+                    )
+                    second = await service.call(
+                        "codex_submit_task",
+                        {"operation_type": "fork_thread", "source_thread_id": "thread-source"},
+                    )
+                    for operation_id in (first["operationId"], second["operationId"]):
+                        for _ in range(50):
+                            status = service.codex_get_operation_status({"operation_id": operation_id})
+                            if status.get("status") == "completed":
+                                break
+                            await asyncio.sleep(0.01)
+                    return first, second, fake.thread_fork_calls
+                finally:
+                    await service.close()
+
+        first, second, fork_calls = asyncio.run(scenario())
+
+        self.assertNotEqual(first["operationId"], second["operationId"])
+        self.assertEqual(2, len(fork_calls))
+
+    def test_submit_task_fork_thread_with_message_starts_turn_in_fork(self) -> None:
+        async def scenario() -> tuple[dict, dict, dict, list[dict], list[dict]]:
+            with TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                project = root / "Project"
+                project.mkdir()
+                service = ToolService(_search_service_config(root, root / ".codex" / "state_5.sqlite"))
+                fake = FakeAppServer(service.storage, first_message="fork first")
+                service._app_server = fake  # type: ignore[assignment]
+                project_id = project_id_for_path(str(project))
+                try:
+                    fake.tracker.register_turn(
+                        turn_id="turn-source",
+                        thread_id="thread-source",
+                        chat_id="thread-source",
+                        project_id=project_id,
+                        project_path=str(project),
+                    )
+                    submitted = await service.call(
+                        "codex_submit_task",
+                        {
+                            "operation_type": "fork_thread",
+                            "source_thread_id": "thread-source",
+                            "message": "continue in fork",
+                            "client_request_id": "fork-message-client-1",
+                            "fork_config": {"safe": True},
+                            "ephemeral": False,
+                        },
+                    )
+                    accepted = submitted
+                    for _ in range(50):
+                        accepted = service.codex_get_operation_status({"operation_id": submitted["operationId"]})
+                        if accepted.get("turnId"):
+                            break
+                        await asyncio.sleep(0.01)
+                    fake.tracker.record_event(
+                        {
+                            "method": "turn/completed",
+                            "params": {
+                                "threadId": accepted["threadId"],
+                                "turnId": accepted["turnId"],
+                                "status": "completed",
+                            },
+                        },
+                        received_at="2026-05-25T00:00:02+00:00",
+                    )
+                    completed = service.codex_get_operation_status({"operation_id": submitted["operationId"]})
+                    return submitted, accepted, completed, fake.thread_fork_calls, fake.turn_start_calls
+                finally:
+                    await service.close()
+
+        submitted, accepted, completed, fork_calls, turn_start_calls = asyncio.run(scenario())
+
+        self.assertEqual("fork_thread", submitted["operationType"])
+        self.assertEqual("running", accepted["status"])
+        self.assertEqual("thread-fork", accepted["threadId"])
+        self.assertEqual("turn-fake", accepted["turnId"])
+        self.assertTrue(accepted["forkState"]["accepted"])
+        self.assertTrue(accepted["forkState"]["hasInitialMessage"])
+        self.assertEqual("turn-fake", accepted["forkState"]["turnId"])
+        self.assertEqual("poll_turn_status", accepted["nextRecommendedAction"])
+        self.assertEqual(1, len(fork_calls))
+        self.assertEqual(1, len(turn_start_calls))
+        self.assertEqual("thread-fork", turn_start_calls[0]["thread_id"])
+        self.assertEqual("completed", completed["status"])
+
+    def test_operation_recovery_after_fork_creation_does_not_create_second_fork(self) -> None:
+        async def scenario() -> tuple[dict, int, int]:
+            with TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                project = root / "Project"
+                project.mkdir()
+                service = ToolService(_search_service_config(root, root / ".codex" / "state_5.sqlite"))
+                fake = FakeAppServer(service.storage, first_message="fork recovered first")
+                service._app_server = fake  # type: ignore[assignment]
+                operation_id = "op-recover-fork"
+                request = {
+                    "operation_type": "fork_thread",
+                    "source_thread_id": "thread-source",
+                    "message": "recover fork turn",
+                    "cwd": str(project),
+                    "_skip_prompt_dedup": True,
+                    "_operation_id": operation_id,
+                }
+                try:
+                    service.storage.create_operation(
+                        _storage_operation_row(
+                            operation_id,
+                            status="starting_turn",
+                            operation_type="fork_thread",
+                            thread_id="thread-fork-existing",
+                            cwd=str(project),
+                            request=request,
+                        )
+                    )
+                    status = {}
+                    for _ in range(50):
+                        status = service.codex_get_operation_status({"operation_id": operation_id})
+                        if status.get("turnId"):
+                            break
+                        await asyncio.sleep(0.01)
+                    return status, len(fake.thread_fork_calls), len(fake.turn_start_calls)
+                finally:
+                    await service.close()
+
+        status, fork_count, turn_start_count = asyncio.run(scenario())
+
+        self.assertEqual("running", status["status"])
+        self.assertEqual("thread-fork-existing", status["threadId"])
+        self.assertEqual("turn-fake", status["turnId"])
+        self.assertEqual(0, fork_count)
+        self.assertEqual(1, turn_start_count)
+
+    def test_startup_recovery_completes_fork_only_after_fork_creation(self) -> None:
+        with TemporaryDirectory() as tmp:
+            storage = McpStorage(Path(tmp) / "mcp.sqlite")
+            storage.connect()
+            try:
+                operation_id = "op-fork-only-recover"
+                storage.create_operation(
+                    _storage_operation_row(
+                        operation_id,
+                        status="starting_thread",
+                        operation_type="fork_thread",
+                        thread_id="thread-fork-recovered",
+                        request={
+                            "operation_type": "fork_thread",
+                            "source_thread_id": "thread-source",
+                            "cwd": str(Path(tmp)),
+                            "_operation_id": operation_id,
+                        },
+                    )
+                )
+                recovered = storage.recover_startup_operations(now="2026-05-25T00:05:00+00:00")
+                stored = storage.get_operation(operation_id) or {}
+            finally:
+                storage.close()
+
+        self.assertEqual([operation_id], recovered["completedOperationIds"])
+        self.assertEqual("completed", stored["status"])
+        self.assertEqual("thread-fork-recovered", stored["thread_id"])
+
     def test_submit_task_steer_turn_is_durable_idempotent_and_follows_target_turn(self) -> None:
         async def scenario() -> tuple[dict, dict, dict, dict, list[dict], int, object]:
             with TemporaryDirectory() as tmp:
@@ -3253,6 +5099,223 @@ class McpDefinitionTests(unittest.TestCase):
         self.assertEqual("INVALID_ARGUMENT", terminal["error"]["code"])
         self.assertEqual("CODEX_TURN_NOT_FOUND", unknown["error"]["code"])
 
+    def test_thread_lifecycle_archive_and_unarchive_are_audited(self) -> None:
+        async def scenario() -> tuple[dict, dict, int, int, int, list[dict]]:
+            with TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                project = root / "Project"
+                project.mkdir()
+                config = _search_service_config(root, root / ".codex" / "state_5.sqlite")
+                service = ToolService(config)
+                fake = FakeAppServer(service.storage, first_message=None)
+                service._app_server = fake  # type: ignore[assignment]
+                project_id = project_id_for_path(str(project))
+                fake.tracker.register_turn(
+                    turn_id="turn-life",
+                    thread_id="thread-life",
+                    chat_id="thread-life",
+                    project_id=project_id,
+                    project_path=str(project),
+                    status="completed",
+                )
+                refresh_count = 0
+                original_refresh = service.catalog.refresh
+
+                def counted_refresh() -> None:
+                    nonlocal refresh_count
+                    refresh_count += 1
+                    original_refresh()
+
+                service.catalog.refresh = counted_refresh  # type: ignore[method-assign]
+                try:
+                    archived = await service.call(
+                        "codex_archive_thread",
+                        {"thread_id": "thread-life", "project_id": project_id, "timeout_seconds": 7},
+                    )
+                    unarchived = await service.call(
+                        "codex_unarchive_thread",
+                        {"thread_id": "thread-life", "project_id": project_id, "timeout_seconds": 8},
+                    )
+                    actions = service.storage.list_thread_lifecycle_actions(thread_id="thread-life", limit=10)
+                    return (
+                        archived,
+                        unarchived,
+                        refresh_count,
+                        len(fake.thread_archive_calls),
+                        len(fake.thread_unarchive_calls),
+                        actions,
+                    )
+                finally:
+                    await service.close()
+
+        archived, unarchived, refresh_count, archive_calls, unarchive_calls, actions = asyncio.run(scenario())
+
+        self.assertEqual("archive", archived["actionType"])
+        self.assertEqual("completed", archived["status"])
+        self.assertFalse(archived["pollRecommended"])
+        self.assertTrue(archived["threadState"]["archived"])
+        self.assertEqual("unarchive", unarchived["actionType"])
+        self.assertEqual("completed", unarchived["status"])
+        self.assertFalse(unarchived["threadState"]["archived"])
+        self.assertEqual(1, archive_calls)
+        self.assertEqual(1, unarchive_calls)
+        self.assertGreaterEqual(refresh_count, 2)
+        self.assertEqual(["completed", "completed"], sorted(item["status"] for item in actions))
+
+    def test_thread_lifecycle_rejects_missing_or_busy_thread(self) -> None:
+        async def scenario() -> tuple[dict, dict, int]:
+            with TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                project = root / "Project"
+                project.mkdir()
+                service = ToolService(_search_service_config(root, root / ".codex" / "state_5.sqlite"))
+                fake = FakeAppServer(service.storage, first_message=None)
+                service._app_server = fake  # type: ignore[assignment]
+                fake.tracker.register_turn(
+                    turn_id="turn-busy",
+                    thread_id="thread-busy",
+                    chat_id="thread-busy",
+                    project_id=project_id_for_path(str(project)),
+                    project_path=str(project),
+                    status="running",
+                )
+                try:
+                    missing = await service.call("codex_archive_thread", {"thread_id": "thread-missing"})
+                    busy_result = await service.call("codex_archive_thread", {"thread_id": "thread-busy"})
+                    return missing, busy_result, len(fake.thread_archive_calls)
+                finally:
+                    await service.close()
+
+        missing, busy_result, archive_calls = asyncio.run(scenario())
+
+        self.assertEqual("CODEX_THREAD_NOT_FOUND", missing["error"]["code"])
+        self.assertEqual("CODEX_BUSY", busy_result["error"]["code"])
+        self.assertEqual(0, archive_calls)
+
+    def test_thread_compaction_status_completes_from_app_server_event(self) -> None:
+        async def scenario() -> tuple[dict, dict, dict, int]:
+            with TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                project = root / "Project"
+                project.mkdir()
+                service = ToolService(_search_service_config(root, root / ".codex" / "state_5.sqlite"))
+                fake = FakeAppServer(service.storage, first_message=None)
+                service._app_server = fake  # type: ignore[assignment]
+                fake.tracker.register_turn(
+                    turn_id="turn-compact",
+                    thread_id="thread-compact",
+                    chat_id="thread-compact",
+                    project_id=project_id_for_path(str(project)),
+                    project_path=str(project),
+                    status="completed",
+                )
+                try:
+                    started = await service.call("codex_start_thread_compaction", {"thread_id": "thread-compact"})
+                    running = await service.call(
+                        "codex_get_thread_compaction_status",
+                        {"action_id": started["actionId"], "include_events": True},
+                    )
+                    service.storage.record_app_server_event(
+                        "inbound",
+                        {
+                            "method": "thread/compacted",
+                            "params": {"threadId": "thread-compact", "turnId": "turn-compact-result"},
+                        },
+                        datetime.now(timezone.utc).isoformat(),
+                        process_generation=1,
+                    )
+                    completed = await service.call(
+                        "codex_get_thread_compaction_status",
+                        {"action_id": started["actionId"]},
+                    )
+                    return started, running, completed, len(fake.thread_compact_start_calls)
+                finally:
+                    await service.close()
+
+        started, running, completed, compact_calls = asyncio.run(scenario())
+
+        self.assertEqual("compact", started["actionType"])
+        self.assertEqual("running", started["status"])
+        self.assertTrue(started["pollRecommended"])
+        self.assertEqual("poll_thread_compaction", started["nextRecommendedAction"])
+        self.assertEqual("running", running["status"])
+        self.assertIn("events", running)
+        self.assertEqual("completed", completed["status"])
+        self.assertFalse(completed["pollRecommended"])
+        self.assertEqual("turn-compact-result", completed["targetTurnId"])
+        self.assertEqual(1, compact_calls)
+
+    def test_thread_compaction_unknown_after_app_server_exit(self) -> None:
+        async def scenario() -> dict:
+            with TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                project = root / "Project"
+                project.mkdir()
+                service = ToolService(_search_service_config(root, root / ".codex" / "state_5.sqlite"))
+                fake = FakeAppServer(service.storage, first_message=None)
+                service._app_server = fake  # type: ignore[assignment]
+                fake.tracker.register_turn(
+                    turn_id="turn-compact-exit",
+                    thread_id="thread-compact-exit",
+                    chat_id="thread-compact-exit",
+                    project_id=project_id_for_path(str(project)),
+                    project_path=str(project),
+                    status="completed",
+                )
+                try:
+                    started = await service.call("codex_start_thread_compaction", {"thread_id": "thread-compact-exit"})
+                    fake.process.returncode = 1
+                    return await service.call(
+                        "codex_get_thread_compaction_status",
+                        {"action_id": started["actionId"]},
+                    )
+                finally:
+                    await service.close()
+
+        status = asyncio.run(scenario())
+
+        self.assertEqual("unknown_after_app_server_exit", status["status"])
+        self.assertEqual("inspect_diagnostics", status["nextRecommendedAction"])
+        self.assertFalse(status["pollRecommended"])
+
+    def test_thread_lifecycle_app_server_error_creates_failed_action(self) -> None:
+        async def scenario() -> tuple[dict, list[dict]]:
+            with TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                project = root / "Project"
+                project.mkdir()
+                service = ToolService(_search_service_config(root, root / ".codex" / "state_5.sqlite"))
+                fake = FakeAppServer(service.storage, first_message=None)
+                service._app_server = fake  # type: ignore[assignment]
+                fake.tracker.register_turn(
+                    turn_id="turn-fail-life",
+                    thread_id="thread-fail-life",
+                    chat_id="thread-fail-life",
+                    project_id=project_id_for_path(str(project)),
+                    project_path=str(project),
+                    status="completed",
+                )
+
+                async def fail_archive(thread_id: str, timeout_seconds: float | None = 30) -> dict:
+                    fake_key = "sk-" + "redacted-test-token"
+                    fake.thread_archive_calls.append({"thread_id": thread_id, "timeout_seconds": timeout_seconds})
+                    raise RuntimeError(f"archive failed with token {fake_key}")
+
+                fake.thread_archive = fail_archive  # type: ignore[method-assign]
+                try:
+                    result = await service.call("codex_archive_thread", {"thread_id": "thread-fail-life"})
+                    actions = service.storage.list_thread_lifecycle_actions(thread_id="thread-fail-life")
+                    return result, actions
+                finally:
+                    await service.close()
+
+        result, actions = asyncio.run(scenario())
+
+        self.assertEqual("CODEX_SEND_FAILED", result["error"]["code"])
+        self.assertEqual(1, len(actions))
+        self.assertEqual("failed", actions[0]["status"])
+        self.assertNotIn("sk-" + "redacted-test-token", actions[0]["last_error"])
+
     def test_two_workers_compete_for_one_operation_and_only_one_starts_turn(self) -> None:
         async def scenario() -> tuple[int, dict]:
             with TemporaryDirectory() as tmp:
@@ -3358,6 +5421,52 @@ class McpDefinitionTests(unittest.TestCase):
         self.assertEqual(0, start_count)
         self.assertEqual("running", stored["status"])
         self.assertEqual("turn-steer-compete", stored["turn_id"])
+
+    def test_two_workers_compete_for_one_fork_operation_and_only_one_forks(self) -> None:
+        async def scenario() -> tuple[int, int, dict]:
+            with TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                project = root / "Project"
+                project.mkdir()
+                state_db = root / ".codex" / "state_5.sqlite"
+                service_a = ToolService(_search_service_config(root, state_db))
+                service_b = ToolService(_search_service_config(root, state_db))
+                fake_a = FakeAppServer(service_a.storage, first_message=None)
+                fake_b = FakeAppServer(service_b.storage, first_message=None)
+                service_a._app_server = fake_a  # type: ignore[assignment]
+                service_b._app_server = fake_b  # type: ignore[assignment]
+                operation_id = "op-fork-compete"
+                request = {
+                    "operation_type": "fork_thread",
+                    "source_thread_id": "thread-source",
+                    "cwd": str(project),
+                    "_operation_id": operation_id,
+                }
+                try:
+                    service_a.storage.create_operation(
+                        _storage_operation_row(
+                            operation_id,
+                            status="queued",
+                            operation_type="fork_thread",
+                            cwd=str(project),
+                            request=request,
+                        )
+                    )
+                    await asyncio.gather(service_a._run_operation(operation_id), service_b._run_operation(operation_id))
+                    stored = service_a.storage.get_operation(operation_id) or {}
+                    fork_count = len(fake_a.thread_fork_calls) + len(fake_b.thread_fork_calls)
+                    start_count = len(fake_a.turn_start_calls) + len(fake_b.turn_start_calls)
+                    return fork_count, start_count, stored
+                finally:
+                    await service_a.close()
+                    await service_b.close()
+
+        fork_count, start_count, stored = asyncio.run(scenario())
+
+        self.assertEqual(1, fork_count)
+        self.assertEqual(0, start_count)
+        self.assertEqual("completed", stored["status"])
+        self.assertEqual("thread-fork", stored["thread_id"])
 
     def test_interrupt_turn_marks_tracked_turn_interrupted(self) -> None:
         with TemporaryDirectory() as tmp:

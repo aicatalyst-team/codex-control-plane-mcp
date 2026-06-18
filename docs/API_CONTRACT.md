@@ -55,11 +55,16 @@ These tools are the supported surface for long-running Codex orchestration:
 - `codex_submit_task`
 - `codex_get_operation_status`
 - `codex_start_plan_workflow`
+- `codex_start_review_workflow`
 - `codex_get_workflow_status`
 - `codex_approve_plan`
 - `codex_list_pending_interactions`
 - `codex_answer_pending_interaction`
 - `codex_interrupt_turn`
+- `codex_archive_thread`
+- `codex_unarchive_thread`
+- `codex_start_thread_compaction`
+- `codex_get_thread_compaction_status`
 - `codex_get_runtime_capabilities`
 - `codex_health_summary`
 - `codex_collect_diagnostics`
@@ -89,6 +94,27 @@ configuration.
 - `send_message`: resume an existing thread and start a new turn.
 - `execute_plan`: execute an approved Plan Mode workflow or existing chat plan.
 - `steer_turn`: send extra text to an active turn through app-server `turn/steer`.
+- `fork_thread`: fork an existing thread through app-server `thread/fork`.
+
+`codex_submit_task` also accepts optional `input_items` for operations that
+start a new turn: `start_chat`, `send_message`, `execute_plan`, and
+`fork_thread` when `message` is present. Supported v1 items are:
+
+- `{"type": "image", "url": "https://...", "detail": "auto|low|high|original"}`
+- `{"type": "localImage", "path": "...", "detail": "auto|low|high|original"}`
+
+Remote image URLs must use `http` or `https`; `data:` and `file:` URLs are
+rejected. Local image paths are resolved against the effective `cwd` when
+relative, must point to an existing file under `CODEX_ALLOWED_ROOTS`, and must
+use `.png`, `.jpg`, `.jpeg`, `.webp`, or `.gif`. Defaults allow 10 image items
+and 20,000,000 bytes per local image. Deployments can override these with
+`CODEX_MCP_MAX_IMAGE_INPUT_ITEMS` and `CODEX_MCP_MAX_IMAGE_INPUT_BYTES`.
+
+Operation status includes `inputItemState` when image inputs were accepted.
+The state contains counts, item types, detail, file extension, size, and hashes.
+It does not include raw image bytes, raw URLs, or full local image paths. MCP
+passes the raw URL/path only to `codex-app-server` for the live `turn/start`
+request.
 
 `steer_turn` requires `thread_id`, `expected_turn_id`, and `message`. It does
 not create a new turn and does not participate in prompt duplicate detection.
@@ -109,6 +135,281 @@ Status payloads for `steer_turn` include normal operation fields plus:
 
 If the target turn is missing, MCP returns `CODEX_TURN_NOT_FOUND`. If the target
 turn is terminal or belongs to another thread, MCP returns `INVALID_ARGUMENT`.
+
+`fork_thread` requires `source_thread_id`. `message` is optional only for this
+operation type. Without `message`, MCP completes the operation as soon as
+app-server returns the forked thread id. With `message`, MCP starts the first
+turn in the forked thread and the operation follows that turn to a terminal
+state.
+
+`fork_thread` does not participate in prompt duplicate detection because two
+similar fork requests may be intentional. Pass `client_request_id` for strict
+retry safety. Reusing the same `client_request_id` returns the same operation
+and does not call `thread/fork` again. Calls without `client_request_id` create
+new fork requests.
+
+Inputs specific to `fork_thread`:
+
+- `source_thread_id`: source thread to fork from.
+- `message`: optional first user message for the forked thread.
+- `cwd`: optional working directory override, inside `CODEX_ALLOWED_ROOTS`.
+- `model`: optional model override.
+- `approval_policy`: optional approval policy for the fork and first turn.
+- `sandbox`: optional sandbox mode for the fork and first turn.
+- `fork_config`: optional object passed to app-server as `config`.
+- `ephemeral`: default `false`.
+
+Status payloads for `fork_thread` include normal operation fields plus:
+
+- `forkState.accepted`
+- `forkState.sourceThreadId`
+- `forkState.forkedThreadId`
+- `forkState.hasInitialMessage`
+- `forkState.cwd`
+- `forkState.model`
+- `forkState.ephemeral`
+- `forkState.turnId`
+
+After fork creation, top-level `threadId` means the forked thread id. For a
+fork-only operation, `nextRecommendedAction` is `read_forked_thread`. For a
+fork with an initial message, running status uses `poll_turn_status`.
+
+## Thread lifecycle management
+
+Lifecycle tools call app-server maintenance methods for known threads. They do
+not use `codex_submit_task` and do not create durable Codex turns.
+
+Tools:
+
+- `codex_archive_thread(thread_id, project_id=null, timeout_seconds=30,
+  refresh_catalog=true)`
+- `codex_unarchive_thread(thread_id, project_id=null, timeout_seconds=30,
+  refresh_catalog=true)`
+- `codex_start_thread_compaction(thread_id, project_id=null,
+  timeout_seconds=30)`
+- `codex_get_thread_compaction_status(action_id, include_events=false)`
+
+`thread_id` must be known through the catalog, tracked turns, or hook history.
+Unknown threads return `CODEX_THREAD_NOT_FOUND`. If the thread has an active
+turn or pending interaction, MCP returns `CODEX_BUSY` and does not call
+app-server.
+
+Archive and unarchive return completed lifecycle audit actions after
+app-server ACK. A successful call refreshes the catalog by default so read and
+search tools see the archived state sooner.
+
+Compaction is pollable. `codex_start_thread_compaction` calls
+`thread/compact/start`, stores a lightweight lifecycle action, and returns:
+
+- `actionId`
+- `actionType="compact"`
+- `threadId`
+- `status="running"`
+- `threadState`
+- `nextRecommendedAction="poll_thread_compaction"`
+- `recommendedPollAfterSeconds`
+- `pollRecommended=true`
+
+`codex_get_thread_compaction_status` returns `running` until MCP observes a
+matching app-server `thread/compacted` event for the same thread. Completed
+responses include `observedEventId` and `targetTurnId`. If the MCP-owned
+app-server exits before that event is observed, the action becomes
+`unknown_after_app_server_exit` with `nextRecommendedAction="inspect_diagnostics"`.
+
+Public `thread/delete` is intentionally not exposed in this contract. It is a
+destructive action and needs a separate confirmation and threat model.
+
+## Code review workflows
+
+`codex_start_review_workflow` starts a durable pollable code review through
+app-server `review/start`. It is a workflow tool, not a public
+`codex_submit_task` operation type. Internally MCP stores a `review_start`
+operation so retry, restart recovery, diagnostics, and final report extraction
+use the same durable state model as other long-running work.
+
+Inputs:
+
+- `thread_id`: optional existing source thread. When present, default delivery
+  is `detached`.
+- `project_id` or `cwd`: used when MCP must create a service source thread.
+  When no existing thread is passed, default delivery is `inline`.
+- `target_type`: `uncommitted_changes`, `base_branch`, `commit`, or `custom`.
+- `base_branch`: required for `target_type="base_branch"`.
+- `commit_sha`: required for `target_type="commit"`.
+- `commit_title`: optional title for commit review.
+- `instructions`: required for `target_type="custom"`.
+- `delivery`: optional `inline` or `detached`.
+- `client_request_id`: strict start idempotency key.
+- `model`, `sandbox`, and `approval_policy`: optional per-call overrides.
+
+Target mapping to app-server:
+
+- `uncommitted_changes` maps to `{ "type": "uncommittedChanges" }`.
+- `base_branch` maps to `{ "type": "baseBranch", "branch": "..." }`.
+- `commit` maps to `{ "type": "commit", "sha": "...", "title": "..." }`.
+- `custom` maps to `{ "type": "custom", "instructions": "..." }`.
+
+PR URLs and raw diffs are not separate v1 targets. Use a local checkout with
+`base_branch`, or use `custom` instructions when the client has already prepared
+the context.
+
+Validation and safety:
+
+- The source thread must be known through catalog, tracked turns, or hook
+  history, unless MCP creates a service thread from `project_id` or `cwd`.
+- `cwd` must be inside `CODEX_ALLOWED_ROOTS`.
+- If the source thread has an active turn or pending interaction, MCP returns
+  `CODEX_BUSY` and does not call app-server.
+- Review workflows do not write files by themselves, but they run inside the
+  selected Codex sandbox and approval policy.
+
+`codex_start_review_workflow` returns a fast workflow ack with:
+
+- `workflowId`
+- `workflowKind="code_review"`
+- `phase`
+- `status`
+- `reviewOperationId`
+- `currentOperationId`
+- nullable `reviewSourceThreadId`, `reviewThreadId`, and `reviewTurnId`
+- `reviewTarget`
+- `reviewDelivery`
+- `nextRecommendedAction`
+
+Poll with `codex_get_workflow_status`. Review workflow status includes:
+
+- `reviewOperation`
+- `reviewTurn`
+- `reviewTarget`
+- `reviewDelivery`
+- `finalReport`
+- `pendingInteractions`
+- `currentOperationId`
+- `reviewOperationId`
+- `reviewSourceThreadId`
+- `reviewThreadId`
+- `reviewTurnId`
+
+Phases are `queued`, `starting_thread`, `starting_review`, `reviewing`,
+`completed`, `failed`, and `orphaned`. Recommended actions are `wait_review`,
+`read_review_report`, `answer_pending_interaction`, and `inspect_diagnostics`.
+
+`codex_get_operation_status` for the internal `review_start` operation includes
+`reviewState`:
+
+- `reviewState.accepted`
+- `reviewState.sourceThreadId`
+- `reviewState.reviewThreadId`
+- `reviewState.reviewTurnId`
+- `reviewState.target`
+- `reviewState.delivery`
+- `reviewState.startAttempted`
+
+If MCP restarts after `review/start` was attempted but before the review turn id
+is persisted, MCP does not start a second review blindly. It marks the operation
+`unknown_after_app_server_exit` and the workflow moves to `orphaned` with
+`nextRecommendedAction="inspect_diagnostics"`.
+
+When the review turn completes, MCP extracts the final assistant message into
+`finalReport`. Valid JSON is exposed as structured report data. Plain text is
+kept as readable `finalReport.text` with `threadId`, `turnId`, and
+`readFullVia`.
+
+## Workflow thread goals
+
+`codex_start_plan_workflow` can mirror an explicit high-level goal into the
+Codex thread through app-server `thread/goal/set`.
+
+Inputs:
+
+- `goal`: optional objective text. If omitted, MCP does not write a thread goal.
+- `goal_token_budget`: optional positive integer passed as `tokenBudget`.
+- `goal_completion_action`: `clear`, `set_complete`, or `leave`. Default
+  `clear`.
+- `goal_completion_objective`: optional objective used with `set_complete`.
+
+Goal sync starts after the workflow has a `threadId`. `codex_get_workflow_status`
+performs best-effort sync and returns:
+
+- `threadGoal.configured`
+- `threadGoal.managed`
+- `threadGoal.syncState`
+- `threadGoal.completionAction`
+- `threadGoal.desiredObjective`
+- `threadGoal.tokenBudget`
+- `threadGoal.currentGoal`
+- `threadGoal.lastSyncedAt`
+- `threadGoal.clearedAt`
+- `threadGoal.lastError`
+- `threadGoal.available`
+
+Common `syncState` values:
+
+- `not_configured`: no explicit `goal` was supplied.
+- `pending_thread`: goal is stored, but the workflow thread is not known yet.
+- `active`: MCP set the app-server thread goal.
+- `cleared`: MCP cleared its managed goal after completion.
+- `complete`: MCP marked the managed goal complete after completion.
+- `left`: MCP left the managed goal unchanged after completion.
+- `external_override`: the current app-server goal no longer matches MCP's
+  managed goal, so MCP skipped completion cleanup.
+- `unsupported`: the local app-server does not support the goal method.
+- `error`: app-server goal sync failed without failing the workflow.
+
+MCP does not auto-generate goals from prompt or title. It redacts and truncates
+goal text in public status and workflow events.
+
+## Structured final reports
+
+`codex_submit_task`, `codex_approve_plan`, and compatibility
+`codex_execute_plan` accept optional `output_schema`.
+
+The field must be a JSON object. MCP validates that it is serializable, non
+empty, within the size limit, and compatible with Codex strict structured
+outputs before it calls app-server. Object schemas must set
+`additionalProperties` to `false`. Invalid schemas return `INVALID_ARGUMENT`
+and do not start a Codex turn.
+
+Supported operation types:
+
+- `start_chat`, `send_message`, and `execute_plan`: `output_schema` is passed to
+  app-server `turn/start` as `outputSchema`.
+- `fork_thread`: `output_schema` is accepted only when the fork request also has
+  an initial `message`.
+- `steer_turn`: `output_schema` is rejected because `turn/steer` does not start
+  a final-answer turn.
+- `codex_start_plan_workflow`: planning turns do not accept `output_schema`.
+  Use `codex_approve_plan(..., output_schema={...})` for execution output.
+
+Status output does not echo the raw schema. It exposes:
+
+- `outputSchemaState.provided`
+- `outputSchemaState.applied`
+- `outputSchemaState.schemaHash`
+- `outputSchemaState.schemaChars`
+- `outputSchemaState.parseStatus`
+- `outputSchemaState.structuredStatus`
+
+When a turn completes, MCP stores the final assistant message in the operation
+row. Workflow execution also copies the same report into the workflow row.
+
+`codex_get_operation_status` and `codex_get_workflow_status` may return:
+
+- `finalReport.text`: readable final assistant text, truncated by the requested
+  message budget.
+- `finalReport.summary`: same compact text for clients that expect a summary
+  field.
+- `finalReport.structured`: parsed JSON object when the final message is valid
+  JSON or contains a fenced `json` block. Otherwise `null`.
+- `finalReport.structuredStatus`: `parsed` or `not_available`.
+- `finalReport.structuredParseStatus`: `valid_json`, `plain_text`, or `empty`.
+- `finalReport.schemaHash`: hash of the requested `output_schema`, when
+  provided.
+- `finalReport.threadId`, `finalReport.turnId`, and `finalReport.readFullVia`.
+
+Plain text remains a valid final report. MCP does not extract hidden
+chain-of-thought, and final reports do not include raw tool payloads or command
+output.
 
 ## Turn progress journal
 
@@ -166,6 +467,8 @@ Input fields:
 - `include_models`: default `true`.
 - `include_hooks`: default `true`.
 - `include_skills`: default `true`.
+- `include_account`: default `true`. When `false`, skips all account, usage,
+  and rate-limit inventory calls.
 
 The tool caches one snapshot for five minutes per `cwd` and include-flag set.
 Inventory calls are best effort. A timeout or error in one app-server method
@@ -197,15 +500,25 @@ Top-level result fields:
   returned, but absolute paths are not returned.
 - `modelProviderCapabilities`: `webSearch`, `imageGeneration`, and
   `namespaceTools`.
+- `accountStatus`: `authenticated`, `requiresOpenaiAuth`, `accountType`,
+  `planType`, `emailPresent`, and `identityRedacted=true`.
+- `accountUsage`: availability, daily bucket count, and coarse bands for
+  lifetime usage, peak daily usage, streaks, and longest turn duration.
+- `rateLimits`: credit availability, unlimited flag, rate-limit reached state,
+  safe used percentages, reset/window minutes, bucket count, and redacted bucket
+  identities.
 
-The endpoint intentionally excludes account email, account usage, and rate
-limit data. Those fields need a separate privacy contract before they can be
-exposed.
+The account blocks never return raw email, account identifiers, credit balance,
+spend-control `limit` or `used`, daily usage dates, daily bucket values, exact
+usage counts, or raw rate-limit ids. Public bucket ids such as `codex` may be
+shown; other bucket identities are represented by a short hash.
 
 `codex_health_summary.runtimeCapabilities` contains only a compact subset from
 the last collected runtime snapshot: status, cache age, model count, default
-model, sandbox readiness, provider capabilities, and warning count. Health
-summary does not collect inventory on its own.
+model, sandbox readiness, provider capabilities, account authentication state,
+account and plan type, rate-limit reached state, credits availability, usage
+availability, and warning count. Health summary does not collect inventory on
+its own and does not include identity fields, balances, or exact usage values.
 
 ## Compatibility tools
 

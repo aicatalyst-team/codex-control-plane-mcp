@@ -61,6 +61,9 @@ That gives you a simple contract:
 | Restart recovery | ad hoc | persisted operation state |
 | Diagnostics | logs only | health, diagnostics, repair tools |
 
+For a more detailed decision guide, see
+[docs/THIN_WRAPPERS.md](docs/THIN_WRAPPERS.md).
+
 ## Current support
 
 - Full live target: Windows with Codex Desktop and `codex-app-server`.
@@ -87,10 +90,16 @@ Recommended first-run posture:
 - SQLite leases and heartbeats for competing MCP processes.
 - Recovery after MCP restart during `thread/start` or `turn/start`.
 - Durable `turn/steer` for adding context to an active turn without creating a second turn.
+- Durable `thread/fork` for branching an existing thread, with or without an initial message.
 - Plan Mode workflows: start plan, poll, approve, execute, read final report.
+- Code review workflows through app-server `review/start`, with polling and final report capture.
+- Structured final reports with `output_schema`.
+- Thread lifecycle tools for archive, unarchive, and pollable compaction.
+- Workflow goal sync with Codex Desktop thread goals.
+- Image and local image inputs for turns that start through `turn/start`.
 - Pending approvals and questions exposed as pollable MCP state.
 - Turn interrupts by `threadId`/`turnId`, `operationId`, or `workflowId`.
-- Runtime inventory for models, permission profiles, sandbox readiness, hooks, skills, provider features, and supported app-server methods.
+- Runtime inventory for models, permission profiles, sandbox readiness, hooks, skills, provider features, account status, usage bands, rate-limit state, and supported app-server methods.
 - Health checks, diagnostics, issue analysis, and dry-run repairs.
 - MCP-owned hook history in SQLite for search, summaries, and fallback reads.
 - Redacted app-server progress journal for deltas, warnings, model reroutes, and token usage.
@@ -211,6 +220,26 @@ codex_get_operation_status(operationId)
 Use the same `client_request_id` when a caller retries after a transport timeout.
 The retry returns the existing operation instead of creating another turn.
 
+Attach screenshots or other image evidence:
+
+```text
+codex_submit_task(
+  operation_type="start_chat",
+  message="Analyze this screen.",
+  input_items=[
+    {"type": "localImage", "path": ".\\screens\\error.png", "detail": "low"},
+    {"type": "image", "url": "https://example.com/screenshot.png", "detail": "high"}
+  ]
+)
+```
+
+Image inputs are accepted only for operation types that start a new turn:
+`start_chat`, `send_message`, `execute_plan`, and `fork_thread` with an initial
+message. MCP sends the path or URL to `codex-app-server`, but operation status
+and diagnostics return only safe metadata such as type, detail, size, extension,
+and hashes. Binary image content, raw URLs, and full local image paths are not
+stored in public status payloads.
+
 Steer an active turn:
 
 ```text
@@ -222,6 +251,68 @@ codex_get_operation_status(operationId)
 
 Use `steer_turn` only while the target turn is active. For a completed thread,
 use `send_message` instead.
+
+Fork a thread:
+
+```text
+codex_submit_task(operation_type="fork_thread", source_thread_id=...)
+  -> operationId
+codex_get_operation_status(operationId)
+  -> completed, threadId=<forkedThreadId>
+```
+
+Start work in the fork right away:
+
+```text
+codex_submit_task(operation_type="fork_thread", source_thread_id=..., message=...)
+  -> operationId
+codex_get_operation_status(operationId)
+  -> follows the first turn in the forked thread
+```
+
+Use `client_request_id` for retry-safe fork requests. Without it, each call is
+treated as a new fork request. `threadId` in operation status is the forked
+thread; the source thread is reported in `forkState.sourceThreadId`.
+
+Manage thread lifecycle:
+
+```text
+codex_archive_thread(thread_id)
+  -> completed
+codex_unarchive_thread(thread_id)
+  -> completed
+codex_start_thread_compaction(thread_id)
+  -> actionId
+codex_get_thread_compaction_status(actionId)
+  -> running / completed / unknown_after_app_server_exit
+```
+
+Archive and unarchive are audit actions around app-server `thread/archive` and
+`thread/unarchive`. They refuse to run while the thread has an active turn or a
+pending interaction. Compaction uses its own lightweight `actionId` because
+`thread/compact/start` is asynchronous. Public `thread/delete` is intentionally
+not exposed.
+
+Ask for a structured final report:
+
+```text
+codex_submit_task(operation_type="start_chat", message=..., output_schema={...})
+codex_approve_plan(workflowId, output_schema={...})
+  -> operationId / executionOperationId
+codex_get_operation_status(operationId)
+codex_get_workflow_status(workflowId)
+  -> finalReport.text + finalReport.structured
+```
+
+`output_schema` is passed to app-server `turn/start` and is tracked by a schema
+hash in status output. Object schemas must use the strict form required by Codex:
+set `additionalProperties` to `false`. MCP stores the final assistant message
+as readable text, then parses JSON object output into `finalReport.structured`
+when Codex returns valid JSON. Plain text still works and stays available in
+`finalReport.text`.
+
+MCP does not extract hidden chain-of-thought and does not store raw tool
+payloads or command output in final reports.
 
 Drive Plan Mode:
 
@@ -235,6 +326,40 @@ codex_approve_plan(workflowId)
 codex_get_workflow_status(workflowId)
   -> finalReport
 ```
+
+Mirror a workflow goal into Codex Desktop when the client has one:
+
+```text
+codex_start_plan_workflow(goal="Review the migration plan", goal_completion_action="clear")
+codex_get_workflow_status(workflowId)
+  -> threadGoal.syncState + threadGoal.currentGoal
+```
+
+MCP writes a thread goal only when the client passes `goal`. Managed goals use
+`clear` after completion by default. Use `set_complete` or `leave` when the goal
+should remain visible after the workflow ends.
+
+Run a Codex code review:
+
+```text
+codex_start_review_workflow(thread_id=..., target_type="base_branch", base_branch="main")
+  -> workflowId
+codex_get_workflow_status(workflowId)
+  -> wait_review / read_review_report
+```
+
+Or let MCP create a service thread for a local checkout:
+
+```text
+codex_start_review_workflow(cwd=..., target_type="uncommitted_changes")
+  -> workflowId
+codex_get_workflow_status(workflowId)
+  -> reviewThreadId + reviewTurnId + finalReport
+```
+
+Review workflows do not write files by themselves. They run inside the selected
+Codex sandbox and approval policy. Use `client_request_id` when a caller may
+retry the start request after a transport timeout.
 
 Handle approvals and questions:
 
@@ -268,13 +393,21 @@ The response includes:
 - Windows sandbox readiness;
 - provider capabilities for web search, image generation, and namespace tools;
 - hook and skill counts without raw hook commands or absolute skill paths;
+- redacted account status, coarse usage bands, and operational rate-limit state;
 - supported app-server schema methods with a compact source, version, and hash.
+
+Account inventory is safe to show to an orchestrator. It reports whether Codex
+is authenticated, the account and plan type, whether an email exists, whether
+usage data is available, and whether a rate limit or credits issue is visible.
+It does not return raw email, account identifiers, credit balances, spend
+limits, exact spend used, daily usage buckets, or exact token counts.
 
 If one inventory method times out or fails, the tool still returns `ok=true`
 with `runtimeCapabilities.status="partial"` and a machine-readable warning in
 `methodResults`. Set `refresh=true` to bypass the cache. `codex_health_summary`
 shows a small `runtimeCapabilities` subset from the last collected snapshot and
-does not start app-server on its own.
+does not start app-server on its own. Pass `include_account=false` when a client
+does not need account, usage, or rate-limit status.
 
 ## Progress journal
 
@@ -298,11 +431,16 @@ Stable orchestration tools:
 - `codex_submit_task`
 - `codex_get_operation_status`
 - `codex_start_plan_workflow`
+- `codex_start_review_workflow`
 - `codex_get_workflow_status`
 - `codex_approve_plan`
 - `codex_list_pending_interactions`
 - `codex_answer_pending_interaction`
 - `codex_interrupt_turn`
+- `codex_archive_thread`
+- `codex_unarchive_thread`
+- `codex_start_thread_compaction`
+- `codex_get_thread_compaction_status`
 - `codex_get_runtime_capabilities`
 - `codex_health_summary`
 - `codex_collect_diagnostics`
@@ -381,6 +519,8 @@ Common variables:
 - `CODEX_MCP_DEFAULT_APPROVAL_POLICY`: default write approval policy. Defaults to `on-request`.
 - `CODEX_MCP_DEFAULT_MODEL`: default Codex model passed to app-server.
 - `CODEX_MCP_DEFAULT_EFFORT`: default effort level.
+- `CODEX_MCP_MAX_IMAGE_INPUT_ITEMS`: max image attachments per `codex_submit_task`. Defaults to `10`.
+- `CODEX_MCP_MAX_IMAGE_INPUT_BYTES`: max bytes for one local image input. Defaults to `20000000`.
 - `CODEX_MCP_APPROVAL_RESPONSE_TIMEOUT_SECONDS`: pending interaction timeout.
 - `DEEPSEEK_ENV_PATH`: optional `.env` file for DeepSeek summary settings.
 - `DEEPSEEK_SUMMARY_ENABLED`: enables or disables remote summary calls.

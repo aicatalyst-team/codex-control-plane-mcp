@@ -53,6 +53,8 @@ class ServerConfig:
     default_tail_max_chars: int = 30_000
     hook_history_enabled: bool = True
     hook_history_max_text_chars: int = 20_000
+    max_image_input_items: int = 10
+    max_image_input_bytes: int = 20_000_000
 
     @classmethod
     def load(cls, base_dir: Path | None = None) -> "ServerConfig":
@@ -189,6 +191,16 @@ class ServerConfig:
                 os.environ.get("CODEX_MCP_HOOK_HISTORY_MAX_TEXT_CHARS")
                 or payload.get("hook_history_max_text_chars"),
                 20_000,
+            ),
+            max_image_input_items=_int_value(
+                os.environ.get("CODEX_MCP_MAX_IMAGE_INPUT_ITEMS")
+                or payload.get("max_image_input_items"),
+                10,
+            ),
+            max_image_input_bytes=_int_value(
+                os.environ.get("CODEX_MCP_MAX_IMAGE_INPUT_BYTES")
+                or payload.get("max_image_input_bytes"),
+                20_000_000,
             ),
         )
 

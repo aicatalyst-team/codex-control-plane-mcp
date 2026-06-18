@@ -12,9 +12,10 @@ from contextlib import suppress
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from . import __version__
-from .catalog import ProjectChatCatalog
+from .catalog import ProjectChatCatalog, project_id_for_path
 from .chat_summarizer import ChatHistorySplit, filter_meaningful_messages_for_summary, summarize_chat_history, split_before_latest_user
 from .codex_app_server import CodexAppServerClient
 from .config import ServerConfig, canonical_existing_path, is_allowed_path, path_key
@@ -49,11 +50,14 @@ from .prompt_dedup import DEFAULT_PROMPT_SIMILARITY_THRESHOLD, normalize_prompt,
 from .protocol import with_output_schema
 from .runtime_capabilities import (
     RUNTIME_CAPABILITIES_CACHE_TTL_SECONDS,
+    compact_account_status,
+    compact_account_usage,
     compact_hooks,
     compact_initialize_result,
     compact_models,
     compact_permission_profiles,
     compact_provider_capabilities,
+    compact_rate_limits,
     compact_sandbox_readiness,
     compact_skills,
     now_iso as runtime_now_iso,
@@ -77,6 +81,11 @@ DEFAULT_TOOL_START_TIMEOUT_SECONDS = 300
 DEFAULT_FIRST_MESSAGE_TIMEOUT_SECONDS = 0
 OPERATION_LEASE_TTL_SECONDS = 120
 OPERATION_HEARTBEAT_SECONDS = 30
+OUTPUT_SCHEMA_MAX_CHARS = 50_000
+IMAGE_INPUT_URL_MAX_CHARS = 8192
+SUPPORTED_IMAGE_INPUT_SUFFIXES = {".gif", ".jpeg", ".jpg", ".png", ".webp"}
+SUPPORTED_IMAGE_INPUT_DETAILS = {"auto", "low", "high", "original"}
+GOAL_COMPLETION_ACTIONS = {"clear", "set_complete", "leave"}
 LOG = get_logger("tools")
 PROMPT_OPERATION_ACTIVE_STATUSES = OPERATION_ACTIVE_STATUSES
 CONTRACT_VERSION = "1"
@@ -86,11 +95,16 @@ STABLE_OPENCLAW_TOOLS = {
     "codex_submit_task",
     "codex_get_operation_status",
     "codex_start_plan_workflow",
+    "codex_start_review_workflow",
     "codex_get_workflow_status",
     "codex_approve_plan",
     "codex_list_pending_interactions",
     "codex_answer_pending_interaction",
     "codex_interrupt_turn",
+    "codex_archive_thread",
+    "codex_unarchive_thread",
+    "codex_start_thread_compaction",
+    "codex_get_thread_compaction_status",
     "codex_get_runtime_capabilities",
     "codex_health_summary",
     "codex_collect_diagnostics",
@@ -309,6 +323,28 @@ TOOLS: list[dict[str, Any]] = [
                 "sandbox": {"type": ["string", "null"], "enum": ["read-only", "workspace-write", "danger-full-access", None], "default": "read-only"},
                 "approval_policy": {"type": ["string", "null"], "enum": ["never", "on-request", "on-failure", "untrusted", "ask_openclaw", None], "default": "on-request"},
                 "client_request_id": {"type": ["string", "null"], "default": None},
+                "goal": {
+                    "type": ["string", "null"],
+                    "default": None,
+                    "description": "Optional explicit Codex thread goal objective mirrored through app-server thread/goal/set after the workflow thread exists.",
+                },
+                "goal_token_budget": {
+                    "type": ["integer", "null"],
+                    "minimum": 1,
+                    "maximum": 10000000,
+                    "default": None,
+                },
+                "goal_completion_action": {
+                    "type": ["string", "null"],
+                    "enum": ["clear", "set_complete", "leave", None],
+                    "default": "clear",
+                    "description": "What MCP should do with its managed Codex thread goal after workflow completion.",
+                },
+                "goal_completion_objective": {
+                    "type": ["string", "null"],
+                    "default": None,
+                    "description": "Optional objective used when goal_completion_action is set_complete.",
+                },
                 "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 7200, "default": DEFAULT_TOOL_START_TIMEOUT_SECONDS},
                 "first_message_timeout_seconds": {
                     "type": "integer",
@@ -317,6 +353,35 @@ TOOLS: list[dict[str, Any]] = [
                     "default": DEFAULT_FIRST_MESSAGE_TIMEOUT_SECONDS,
                     "description": "Deprecated and ignored. Workflow start returns after turn/start; poll codex_get_workflow_status for plan readiness.",
                 },
+                "first_message_max_chars": {"type": "integer", "minimum": 500, "maximum": 200000, "default": 8000},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "codex_start_review_workflow",
+        "description": "Start a durable Codex code review workflow through app-server review/start. Returns a fast workflow ack; poll codex_get_workflow_status for review progress and final report.",
+        "inputSchema": {
+            "type": "object",
+            "required": ["target_type"],
+            "properties": {
+                "thread_id": {"type": ["string", "null"], "default": None},
+                "project_id": {"type": ["string", "null"], "default": None},
+                "cwd": {"type": ["string", "null"], "default": None},
+                "target_type": {
+                    "type": "string",
+                    "enum": ["uncommitted_changes", "base_branch", "commit", "custom"],
+                },
+                "base_branch": {"type": ["string", "null"], "default": None},
+                "commit_sha": {"type": ["string", "null"], "default": None},
+                "commit_title": {"type": ["string", "null"], "default": None},
+                "instructions": {"type": ["string", "null"], "default": None, "maxLength": 200000},
+                "delivery": {"type": ["string", "null"], "enum": ["inline", "detached", None], "default": None},
+                "client_request_id": {"type": ["string", "null"], "default": None},
+                "model": {"type": ["string", "null"], "default": None},
+                "sandbox": {"type": ["string", "null"], "enum": ["read-only", "workspace-write", "danger-full-access", None], "default": "read-only"},
+                "approval_policy": {"type": ["string", "null"], "enum": ["never", "on-request", "on-failure", "untrusted", "ask_openclaw", None], "default": "on-request"},
+                "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 7200, "default": DEFAULT_TOOL_START_TIMEOUT_SECONDS},
                 "first_message_max_chars": {"type": "integer", "minimum": 500, "maximum": 200000, "default": 8000},
             },
             "additionalProperties": False,
@@ -351,6 +416,12 @@ TOOLS: list[dict[str, Any]] = [
                     "description": "Stable retry idempotency key for workflow approval/execution.",
                 },
                 "message": {"type": ["string", "null"], "default": "Implement the plan."},
+                "output_schema": {
+                    "type": ["object", "null"],
+                    "default": None,
+                    "additionalProperties": True,
+                    "description": "Optional JSON Schema passed to app-server outputSchema for the execution turn final assistant message.",
+                },
                 "approval_policy": {
                     "type": "string",
                     "enum": ["never", "on-request", "on-failure", "untrusted", "respect_existing", "never_auto_approve", "ask_openclaw"],
@@ -395,6 +466,12 @@ TOOLS: list[dict[str, Any]] = [
                 "project_id": {"type": ["string", "null"], "default": None},
                 "client_request_id": {"type": ["string", "null"], "default": None},
                 "message": {"type": ["string", "null"], "default": "Implement the plan."},
+                "output_schema": {
+                    "type": ["object", "null"],
+                    "default": None,
+                    "additionalProperties": True,
+                    "description": "Optional JSON Schema passed to app-server outputSchema for the execution turn final assistant message.",
+                },
                 "force": {"type": "boolean", "default": False},
                 "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 7200, "default": DEFAULT_TOOL_START_TIMEOUT_SECONDS},
                 "first_message_timeout_seconds": {
@@ -424,9 +501,9 @@ TOOLS: list[dict[str, Any]] = [
         "description": "Durably queue a Codex write operation and return immediately with operationId. Use codex_get_operation_status to poll threadId, turnId, messages, pending interactions, and completion.",
         "inputSchema": {
             "type": "object",
-            "required": ["operation_type", "message"],
+            "required": ["operation_type"],
             "properties": {
-                "operation_type": {"type": "string", "enum": ["start_chat", "send_message", "execute_plan", "steer_turn"]},
+                "operation_type": {"type": "string", "enum": ["start_chat", "send_message", "execute_plan", "steer_turn", "fork_thread"]},
                 "client_request_id": {
                     "type": ["string", "null"],
                     "default": None,
@@ -439,16 +516,65 @@ TOOLS: list[dict[str, Any]] = [
                     "default": None,
                     "description": "Required for operation_type='steer_turn'. Target thread that owns the active turn.",
                 },
+                "source_thread_id": {
+                    "type": ["string", "null"],
+                    "default": None,
+                    "description": "Required for operation_type='fork_thread'. Source thread to fork from.",
+                },
                 "expected_turn_id": {
                     "type": ["string", "null"],
                     "default": None,
                     "description": "Required for operation_type='steer_turn'. Active turn id precondition passed to Codex app-server.",
                 },
                 "workflow_id": {"type": ["string", "null"], "default": None},
-                "message": {"type": "string", "minLength": 1, "maxLength": 200000},
+                "message": {
+                    "type": ["string", "null"],
+                    "minLength": 1,
+                    "maxLength": 200000,
+                    "default": None,
+                    "description": "Required for all operation types except fork_thread. For fork_thread, omit it for fork-only or provide it to start the first turn in the forked thread.",
+                },
+                "input_items": {
+                    "type": ["array", "null"],
+                    "default": None,
+                    "maxItems": 10,
+                    "description": "Optional image inputs appended to the text message for operation types that start a new turn. Supports image URL and localImage file path items only.",
+                    "items": {
+                        "oneOf": [
+                            {
+                                "type": "object",
+                                "required": ["type", "url"],
+                                "properties": {
+                                    "type": {"type": "string", "enum": ["image"]},
+                                    "url": {"type": "string", "minLength": 1, "maxLength": IMAGE_INPUT_URL_MAX_CHARS},
+                                    "detail": {"type": ["string", "null"], "enum": ["auto", "low", "high", "original", None], "default": "auto"},
+                                },
+                                "additionalProperties": False,
+                            },
+                            {
+                                "type": "object",
+                                "required": ["type", "path"],
+                                "properties": {
+                                    "type": {"type": "string", "enum": ["localImage"]},
+                                    "path": {"type": "string", "minLength": 1},
+                                    "detail": {"type": ["string", "null"], "enum": ["auto", "low", "high", "original", None], "default": "auto"},
+                                },
+                                "additionalProperties": False,
+                            },
+                        ]
+                    },
+                },
                 "title": {"type": ["string", "null"], "default": None},
                 "cwd": {"type": ["string", "null"], "default": None},
                 "model": {"type": ["string", "null"], "default": None},
+                "fork_config": {"type": ["object", "null"], "default": None, "additionalProperties": True},
+                "ephemeral": {"type": "boolean", "default": False},
+                "output_schema": {
+                    "type": ["object", "null"],
+                    "default": None,
+                    "additionalProperties": True,
+                    "description": "Optional JSON Schema passed to app-server outputSchema for this turn final assistant message.",
+                },
                 "collaboration_mode": {"type": ["string", "null"], "enum": ["default", "plan", None], "default": None},
                 "approval_policy": {"type": ["string", "null"], "enum": ["never", "on-request", "on-failure", "untrusted", "ask_openclaw", "respect_existing", "never_auto_approve", None], "default": "on-request"},
                 "sandbox": {"type": ["string", "null"], "enum": ["read-only", "workspace-write", "danger-full-access", "respect_existing", None], "default": "read-only"},
@@ -533,6 +659,63 @@ TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "codex_archive_thread",
+        "description": "Archive a known Codex thread through codex-app-server thread/archive. Refuses to run while the thread has active work.",
+        "inputSchema": {
+            "type": "object",
+            "required": ["thread_id"],
+            "properties": {
+                "thread_id": {"type": "string", "minLength": 1},
+                "project_id": {"type": ["string", "null"], "default": None},
+                "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 120, "default": 30},
+                "refresh_catalog": {"type": "boolean", "default": True},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "codex_unarchive_thread",
+        "description": "Unarchive a known Codex thread through codex-app-server thread/unarchive. Refuses to run while the thread has active work.",
+        "inputSchema": {
+            "type": "object",
+            "required": ["thread_id"],
+            "properties": {
+                "thread_id": {"type": "string", "minLength": 1},
+                "project_id": {"type": ["string", "null"], "default": None},
+                "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 120, "default": 30},
+                "refresh_catalog": {"type": "boolean", "default": True},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "codex_start_thread_compaction",
+        "description": "Start Codex context compaction for a known thread through codex-app-server thread/compact/start. Poll codex_get_thread_compaction_status with the returned actionId.",
+        "inputSchema": {
+            "type": "object",
+            "required": ["thread_id"],
+            "properties": {
+                "thread_id": {"type": "string", "minLength": 1},
+                "project_id": {"type": ["string", "null"], "default": None},
+                "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 120, "default": 30},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "codex_get_thread_compaction_status",
+        "description": "Poll a thread compaction action created by codex_start_thread_compaction.",
+        "inputSchema": {
+            "type": "object",
+            "required": ["action_id"],
+            "properties": {
+                "action_id": {"type": "string", "minLength": 1},
+                "include_events": {"type": "boolean", "default": False},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
         "name": "codex_restart_app_server",
         "description": "Restart only the MCP-owned Codex app-server subprocess. This does not restart Codex Desktop and refuses to run while the MCP app-server has active turns, captures, or pending requests.",
         "inputSchema": {
@@ -558,7 +741,7 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "codex_get_runtime_capabilities",
-        "description": "Read a compact cached inventory of local codex-app-server runtime capabilities: models, permission profiles, sandbox readiness, hooks, skills, provider features, and supported schema methods.",
+        "description": "Read a compact cached inventory of local codex-app-server runtime capabilities: models, permission profiles, sandbox readiness, hooks, skills, provider features, redacted account status, and supported schema methods.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -568,6 +751,7 @@ TOOLS: list[dict[str, Any]] = [
                 "include_models": {"type": "boolean", "default": True},
                 "include_hooks": {"type": "boolean", "default": True},
                 "include_skills": {"type": "boolean", "default": True},
+                "include_account": {"type": "boolean", "default": True},
             },
             "additionalProperties": False,
         },
@@ -746,6 +930,67 @@ class ToolService:
             return message
         return f"{message}\n\n[latest completed plan]\n{plan_text}"
 
+    def _normalize_turn_input_items(
+        self,
+        *,
+        message: str,
+        raw_items: Any,
+        cwd: str,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+        if raw_items in (None, ""):
+            return [{"type": "text", "text": message}], None
+        if not isinstance(raw_items, list):
+            raise invalid_argument("input_items must be an array of image input objects.")
+        if len(raw_items) > self.config.max_image_input_items:
+            raise invalid_argument(
+                "Too many image input items.",
+                maxItems=self.config.max_image_input_items,
+                actualItems=len(raw_items),
+            )
+
+        normalized: list[dict[str, Any]] = [{"type": "text", "text": message}]
+        safe_items: list[dict[str, Any]] = []
+        dedup_items: list[dict[str, Any]] = []
+        image_url_count = 0
+        local_image_count = 0
+
+        for index, raw_item in enumerate(raw_items):
+            if not isinstance(raw_item, dict):
+                raise invalid_argument("input_items entries must be objects.", index=index)
+            item_type = str(raw_item.get("type") or "")
+            detail = _image_input_detail(raw_item.get("detail"), index=index)
+            if item_type == "image":
+                normalized_item, safe_item, dedup_item = _normalize_remote_image_input(raw_item, detail=detail, index=index)
+                image_url_count += 1
+            elif item_type == "localImage":
+                normalized_item, safe_item, dedup_item = _normalize_local_image_input(
+                    raw_item,
+                    detail=detail,
+                    index=index,
+                    cwd=cwd,
+                    allowed_roots=self.config.allowed_roots,
+                    max_bytes=self.config.max_image_input_bytes,
+                )
+                local_image_count += 1
+            else:
+                raise invalid_argument("Unsupported input_items type.", index=index, type=item_type)
+            normalized.append(normalized_item)
+            safe_items.append(safe_item)
+            dedup_items.append(dedup_item)
+
+        state = {
+            "provided": True,
+            "count": len(safe_items),
+            "imageUrlCount": image_url_count,
+            "localImageCount": local_image_count,
+            "types": sorted({str(item.get("type") or "") for item in safe_items}),
+            "items": safe_items,
+            "dedupHash": _safe_digest(dedup_items),
+            "maxItems": self.config.max_image_input_items,
+            "maxLocalImageBytes": self.config.max_image_input_bytes,
+        }
+        return normalized, state
+
     def _find_prompt_duplicate(
         self,
         *,
@@ -754,19 +999,21 @@ class ToolService:
         normalized_hash: str,
         ignore_submission_id: str | None = None,
         ignore_operation_id: str | None = None,
+        strict_hash_only: bool = False,
     ) -> dict[str, Any] | None:
         candidates_by_id: dict[str, tuple[dict[str, Any], float]] = {}
         for row in self.storage.find_prompt_submissions_by_hash(project_path_key, normalized_hash, limit=50):
             prompt_submission_id = str(row.get("prompt_submission_id") or "")
             if prompt_submission_id:
                 candidates_by_id[prompt_submission_id] = (row, 1.0)
-        for row in self.storage.list_prompt_submissions_for_project(project_path_key, limit=200):
-            prompt_submission_id = str(row.get("prompt_submission_id") or "")
-            if not prompt_submission_id or prompt_submission_id in candidates_by_id:
-                continue
-            similarity = prompt_similarity(normalized_prompt, str(row.get("prompt_normalized") or ""))
-            if similarity >= DEFAULT_PROMPT_SIMILARITY_THRESHOLD:
-                candidates_by_id[prompt_submission_id] = (row, similarity)
+        if not strict_hash_only:
+            for row in self.storage.list_prompt_submissions_for_project(project_path_key, limit=200):
+                prompt_submission_id = str(row.get("prompt_submission_id") or "")
+                if not prompt_submission_id or prompt_submission_id in candidates_by_id:
+                    continue
+                similarity = prompt_similarity(normalized_prompt, str(row.get("prompt_normalized") or ""))
+                if similarity >= DEFAULT_PROMPT_SIMILARITY_THRESHOLD:
+                    candidates_by_id[prompt_submission_id] = (row, similarity)
 
         matches: list[dict[str, Any]] = []
         for row, similarity in candidates_by_id.values():
@@ -884,6 +1131,7 @@ class ToolService:
         workflow_id: str | None = None,
         ignore_submission_id: str | None = None,
         ignore_operation_id: str | None = None,
+        strict_hash_only: bool = False,
     ) -> dict[str, Any]:
         normalized_prompt = normalize_prompt(dedup_basis)
         normalized_hash = prompt_hash(normalized_prompt)
@@ -893,6 +1141,7 @@ class ToolService:
             normalized_hash=normalized_hash,
             ignore_submission_id=ignore_submission_id,
             ignore_operation_id=ignore_operation_id,
+            strict_hash_only=strict_hash_only,
         )
         if match is not None and match.get("active"):
             raise self._duplicate_prompt_error(match)
@@ -957,6 +1206,60 @@ class ToolService:
             )
         return turn
 
+    def _resolve_fork_source_context(
+        self,
+        *,
+        source_thread_id: str,
+        cwd: Any = None,
+        project_id: str | None = None,
+    ) -> dict[str, Any]:
+        explicit_cwd = _optional_string(cwd)
+        resolved_project_id = project_id
+        resolved_project_path: str | None = None
+        resolved_chat_id: str | None = None
+        source_known = False
+
+        chat = self.catalog.get_chat(source_thread_id, resolved_project_id)
+        if chat is not None:
+            source_known = True
+            resolved_chat_id = chat.chat_id
+            resolved_project_id = chat.project_id or resolved_project_id
+            resolved_project_path = _optional_string(chat.project_path)
+
+        if not resolved_project_path:
+            tracked_turn = self.storage.get_latest_tracked_turn_for_thread(source_thread_id)
+            if tracked_turn is not None:
+                source_known = True
+                resolved_chat_id = _optional_string(tracked_turn.get("chat_id")) or source_thread_id
+                resolved_project_id = _optional_string(tracked_turn.get("project_id")) or resolved_project_id
+                resolved_project_path = _optional_string(tracked_turn.get("project_path"))
+
+        if not resolved_project_path:
+            hook_thread = self.storage.get_hook_thread(source_thread_id)
+            if hook_thread is not None:
+                source_known = True
+                resolved_chat_id = source_thread_id
+                resolved_project_path = _optional_string(hook_thread.get("project_path"))
+                if not resolved_project_id and resolved_project_path:
+                    resolved_project_id = project_id_for_path(resolved_project_path)
+
+        effective_path = canonical_existing_path(explicit_cwd or resolved_project_path)
+        if not effective_path or not is_allowed_path(effective_path, self.config.allowed_roots):
+            if not source_known and not explicit_cwd:
+                raise thread_not_found(source_thread_id)
+            raise invalid_argument("Requested cwd is outside the allowlist.", cwd=effective_path or explicit_cwd or resolved_project_path)
+        if not source_known and not explicit_cwd:
+            raise thread_not_found(source_thread_id)
+        if not resolved_project_id:
+            resolved_project_id = project_id_for_path(effective_path)
+        return {
+            "sourceKnown": source_known,
+            "sourceThreadId": source_thread_id,
+            "chatId": resolved_chat_id or source_thread_id,
+            "projectId": resolved_project_id,
+            "projectPath": effective_path,
+        }
+
     def _dedup_metadata_for_result(self, dedup: dict[str, Any] | None) -> dict[str, Any]:
         if not dedup or dedup.get("action") == "new":
             return {}
@@ -972,6 +1275,58 @@ class ToolService:
             "existingTurnId": dedup.get("existingTurnId"),
             "existingStatus": dedup.get("existingStatus"),
         }
+
+    def _assert_review_source_ready(self, thread_id: str) -> None:
+        active_turn = self._active_turn_for_thread(thread_id)
+        if active_turn is not None:
+            raise busy(thread_id, str(active_turn.get("status") or "running"))
+        pending = self._pending_interactions_for_context(thread_id=thread_id, turn_id=None, status="pending", limit=1)
+        if pending:
+            raise busy(thread_id, "pending_interaction")
+
+    def _update_operation_request_fields(self, operation_id: str, fields: dict[str, Any]) -> None:
+        operation = self.storage.get_operation(operation_id)
+        if operation is None:
+            return
+        payload = _operation_request_from_row(operation)
+        payload.update(fields)
+        self.storage.update_operation(
+            operation_id,
+            request_json=json.dumps(payload, ensure_ascii=False, sort_keys=True),
+            updated_at=_now_iso(),
+        )
+
+    def _mark_review_start_unknown_after_attempt(self, operation: dict[str, Any], *, reason: str) -> None:
+        operation_id = str(operation.get("operation_id") or "")
+        if not operation_id:
+            return
+        now = _now_iso()
+        self.storage.update_operation(
+            operation_id,
+            status="unknown_after_app_server_exit",
+            phase="unknown_after_app_server_exit",
+            last_error=reason,
+            completed_at=now,
+            updated_at=now,
+            next_attempt_at=None,
+        )
+        workflow_id = _optional_string(operation.get("workflow_id"))
+        if workflow_id:
+            self.storage.update_workflow(
+                workflow_id,
+                phase="orphaned",
+                status="unknown_after_app_server_exit",
+                last_error=reason,
+                completed_at=now,
+                updated_at=now,
+            )
+            self.storage.record_workflow_event(
+                workflow_id,
+                event_type="review_start_unknown",
+                message="Code review start could not be safely retried.",
+                details={"operationId": operation_id, "reason": reason},
+                created_at=now,
+            )
 
     async def _steer_turn_resolved(
         self,
@@ -1045,6 +1400,379 @@ class ToolService:
             "recommendedPollAfterSeconds": 15,
         }
 
+    async def _review_start_resolved(self, *, args: dict[str, Any]) -> dict[str, Any]:
+        operation_id = _optional_string(args.get("_operation_id"))
+        workflow_id = _optional_string(args.get("workflow_id"))
+        timeout_seconds = _bounded_int(args.get("timeout_seconds", DEFAULT_TOOL_START_TIMEOUT_SECONDS), 1, 7200)
+        project_id = _optional_string(args.get("project_id"))
+        cwd = canonical_existing_path(args.get("cwd") or args.get("_resolved_project_path"))
+        if not cwd or not is_allowed_path(cwd, self.config.allowed_roots):
+            raise invalid_argument("Requested cwd is outside the allowlist.", cwd=cwd or args.get("cwd"))
+        if not project_id:
+            project_id = project_id_for_path(cwd)
+        target = args.get("_review_target") if isinstance(args.get("_review_target"), dict) else _review_target_from_args(args)
+        delivery = _optional_string(args.get("_review_delivery")) or _optional_string(args.get("delivery")) or "inline"
+        if delivery not in {"inline", "detached"}:
+            raise invalid_argument("Unsupported review delivery.", delivery=delivery)
+        source_thread_id = _optional_string(args.get("_review_source_thread_id")) or _optional_string(args.get("thread_id"))
+        model = _optional_string(args.get("model"))
+        approval_policy = _approval_policy_for_start(args.get("approval_policy"), self.config.default_approval_policy)
+        sandbox_policy = _sandbox_policy(args.get("sandbox")) or self.config.default_sandbox_policy
+        client = await self._app()
+        generation: Any = client.process_generation
+
+        if not source_thread_id:
+            if operation_id:
+                self.storage.update_operation(
+                    operation_id,
+                    status="starting_thread",
+                    phase="starting_thread",
+                    project_id=project_id,
+                    cwd=cwd,
+                    updated_at=_now_iso(),
+                    app_server_generation=client.process_generation,
+                )
+            if workflow_id:
+                self.storage.update_workflow(
+                    workflow_id,
+                    phase="starting_thread",
+                    status="starting_thread",
+                    updated_at=_now_iso(),
+                    app_server_generation=client.process_generation,
+                )
+            thread = await client.thread_start(
+                cwd=cwd,
+                approval_policy=approval_policy,
+                sandbox_policy=sandbox_policy,
+                model=model,
+                effort=self.config.default_effort,
+                summary=self.config.default_summary,
+                timeout_seconds=timeout_seconds,
+            )
+            source_thread_id = _extract_thread_id(thread)
+            if not source_thread_id:
+                raise send_failed("thread/start did not return thread id for review workflow.")
+            generation = thread.get("_processGeneration") or client.process_generation
+            if operation_id:
+                self._update_operation_request_fields(
+                    operation_id,
+                    {
+                        "_review_source_thread_id": source_thread_id,
+                        "thread_id": source_thread_id,
+                        "_review_source_known": True,
+                    },
+                )
+                self.storage.update_operation(
+                    operation_id,
+                    chat_id=source_thread_id,
+                    updated_at=_now_iso(),
+                    app_server_generation=generation,
+                )
+            if workflow_id:
+                self.storage.update_workflow(
+                    workflow_id,
+                    review_source_thread_id=source_thread_id,
+                    updated_at=_now_iso(),
+                    app_server_generation=generation,
+                )
+                self.storage.record_workflow_event(
+                    workflow_id,
+                    event_type="review_source_thread_started",
+                    message="Source thread created for code review workflow.",
+                    details={"sourceThreadId": source_thread_id},
+                    created_at=_now_iso(),
+                )
+
+        self._assert_review_source_ready(source_thread_id)
+        if operation_id:
+            self.storage.update_operation(
+                operation_id,
+                status="starting_review",
+                phase="starting_review",
+                chat_id=source_thread_id,
+                project_id=project_id,
+                cwd=cwd,
+                updated_at=_now_iso(),
+                app_server_generation=generation,
+            )
+            self._update_operation_request_fields(
+                operation_id,
+                {
+                    "_review_start_attempted": True,
+                    "_review_start_attempted_at": _now_iso(),
+                    "_review_source_thread_id": source_thread_id,
+                    "_review_target": target,
+                    "_review_delivery": delivery,
+                },
+            )
+        if workflow_id:
+            self.storage.update_workflow(
+                workflow_id,
+                phase="starting_review",
+                status="starting_review",
+                review_source_thread_id=source_thread_id,
+                review_target_json=json.dumps(target, ensure_ascii=False, sort_keys=True),
+                review_delivery=delivery,
+                updated_at=_now_iso(),
+                app_server_generation=generation,
+            )
+
+        review_result = await client.review_start(
+            thread_id=source_thread_id,
+            target=target,
+            delivery=delivery,
+            timeout_seconds=timeout_seconds,
+        )
+        review_thread_id = _extract_review_thread_id(review_result) or source_thread_id
+        turn = review_result.get("turn") if isinstance(review_result.get("turn"), dict) else {}
+        review_turn_id = _extract_turn_id(review_result)
+        if not review_turn_id:
+            raise send_failed("review/start did not return review turn id.")
+        generation = review_result.get("_processGeneration") or client.process_generation
+        client.tracker.register_turn(
+            turn_id=review_turn_id,
+            thread_id=review_thread_id,
+            chat_id=review_thread_id,
+            project_id=project_id,
+            project_path=cwd,
+            status=_review_turn_initial_status(turn),
+            started_at=_now_iso(),
+            user_message=_review_target_label(target),
+            model=model,
+            permission_mode=approval_policy,
+            request_id=str(review_result.get("_requestId")) if review_result.get("_requestId") is not None else None,
+            process_generation=int(generation) if isinstance(generation, int) else client.process_generation,
+        )
+        review_state = {
+            "accepted": True,
+            "sourceThreadId": source_thread_id,
+            "reviewThreadId": review_thread_id,
+            "reviewTurnId": review_turn_id,
+            "target": target,
+            "delivery": delivery,
+        }
+        result_payload = {
+            "ok": True,
+            "accepted": True,
+            "operationType": "review_start",
+            "workflowId": workflow_id,
+            "chat_id": review_thread_id,
+            "chatId": review_thread_id,
+            "thread_id": review_thread_id,
+            "threadId": review_thread_id,
+            "turn_id": review_turn_id,
+            "turnId": review_turn_id,
+            "project_id": project_id,
+            "projectId": project_id,
+            "sourceThreadId": source_thread_id,
+            "reviewThreadId": review_thread_id,
+            "reviewTurnId": review_turn_id,
+            "reviewTarget": target,
+            "reviewDelivery": delivery,
+            "reviewState": review_state,
+            "status": "running",
+            "phase": "reviewing",
+            "appServerGeneration": generation,
+            "pollRecommended": True,
+            "nextRecommendedAction": "wait_review",
+            "recommendedPollAfterSeconds": 15,
+        }
+        if operation_id:
+            self.storage.update_operation(
+                operation_id,
+                status="running",
+                phase="running",
+                chat_id=review_thread_id,
+                thread_id=review_thread_id,
+                turn_id=review_turn_id,
+                project_id=project_id,
+                cwd=cwd,
+                workflow_id=workflow_id,
+                result_json=json.dumps({**result_payload, "appServerResult": review_result}, ensure_ascii=False),
+                last_error=None,
+                updated_at=_now_iso(),
+                next_attempt_at=None,
+                app_server_generation=generation,
+            )
+        if workflow_id:
+            self.storage.update_workflow(
+                workflow_id,
+                current_operation_id=operation_id,
+                review_operation_id=operation_id,
+                review_source_thread_id=source_thread_id,
+                review_thread_id=review_thread_id,
+                review_turn_id=review_turn_id,
+                thread_id=review_thread_id,
+                phase="reviewing",
+                status="reviewing",
+                last_error=None,
+                updated_at=_now_iso(),
+                app_server_generation=generation,
+            )
+            self.storage.record_workflow_event(
+                workflow_id,
+                event_type="review_started",
+                message="Code review turn started.",
+                details={"sourceThreadId": source_thread_id, "reviewThreadId": review_thread_id, "reviewTurnId": review_turn_id},
+                created_at=_now_iso(),
+            )
+        return result_payload
+
+    async def _fork_thread_resolved(
+        self,
+        *,
+        source_thread_id: str,
+        message: str | None,
+        args: dict[str, Any],
+    ) -> dict[str, Any]:
+        operation_id = _optional_string(args.get("_operation_id"))
+        timeout_seconds = _bounded_int(args.get("timeout_seconds", DEFAULT_TOOL_START_TIMEOUT_SECONDS), 1, 7200)
+        project_id = _optional_string(args.get("project_id"))
+        cwd = canonical_existing_path(args.get("cwd") or args.get("_resolved_project_path"))
+        if not cwd or not is_allowed_path(cwd, self.config.allowed_roots):
+            raise invalid_argument("Requested cwd is outside the allowlist.", cwd=cwd or args.get("cwd"))
+        model = _optional_string(args.get("model"))
+        approval_policy = _approval_policy_for_start(args.get("approval_policy"), self.config.default_approval_policy)
+        sandbox_arg = args.get("sandbox")
+        sandbox_mode = _sandbox_value_from_policy(
+            self.config.default_sandbox_policy
+            if sandbox_arg == "respect_existing"
+            else (_sandbox_policy(sandbox_arg) or self.config.default_sandbox_policy)
+        )
+        fork_config = args.get("fork_config")
+        if fork_config is not None and not isinstance(fork_config, dict):
+            raise invalid_argument("fork_config must be an object when provided.")
+        ephemeral = bool(args.get("ephemeral", False))
+        forked_thread_id = _optional_string(args.get("_resolved_thread_id"))
+        client = await self._app()
+        fork_result: dict[str, Any] = {}
+        generation: Any = client.process_generation
+
+        if forked_thread_id:
+            fork_result = {"thread": {"id": forked_thread_id}, "cwd": cwd, "recovered": True}
+        else:
+            if operation_id:
+                self.storage.update_operation(
+                    operation_id,
+                    status="starting_thread",
+                    phase="starting_thread",
+                    updated_at=_now_iso(),
+                    app_server_generation=client.process_generation,
+                )
+            fork_result = await client.thread_fork(
+                thread_id=source_thread_id,
+                cwd=cwd,
+                approval_policy=approval_policy,
+                sandbox=sandbox_mode,
+                model=model,
+                config=fork_config,
+                ephemeral=ephemeral,
+                timeout_seconds=timeout_seconds,
+            )
+            forked_thread_id = _extract_thread_id(fork_result)
+            if not forked_thread_id:
+                raise send_failed("thread/fork did not return thread id")
+            generation = fork_result.get("_processGeneration") or client.process_generation
+
+        result_cwd = canonical_existing_path(fork_result.get("cwd") or cwd)
+        if not result_cwd or not is_allowed_path(result_cwd, self.config.allowed_roots):
+            raise invalid_argument("Forked thread cwd is outside the allowlist.", cwd=result_cwd or fork_result.get("cwd") or cwd)
+        if not project_id:
+            project_id = project_id_for_path(result_cwd)
+        has_initial_message = bool(_optional_string(message))
+        fork_state = {
+            "accepted": True,
+            "sourceThreadId": source_thread_id,
+            "forkedThreadId": forked_thread_id,
+            "hasInitialMessage": has_initial_message,
+            "cwd": result_cwd,
+            "model": model,
+            "ephemeral": ephemeral,
+            "turnId": None,
+        }
+        base_result = {
+            "ok": True,
+            "accepted": True,
+            "operationType": "fork_thread",
+            "chat_id": forked_thread_id,
+            "chatId": forked_thread_id,
+            "thread_id": forked_thread_id,
+            "threadId": forked_thread_id,
+            "project_id": project_id,
+            "projectId": project_id,
+            "sourceThreadId": source_thread_id,
+            "forkState": fork_state,
+            "effectiveApprovalPolicy": approval_policy,
+            "effectiveSandbox": sandbox_mode,
+            "effectiveCwd": result_cwd,
+            "effectiveModel": model,
+            "appServerGeneration": generation,
+            "forkResult": redact_payload(fork_result),
+        }
+
+        if operation_id:
+            self.storage.update_operation(
+                operation_id,
+                status="starting_turn" if has_initial_message else "completed",
+                phase="starting_turn" if has_initial_message else "completed",
+                chat_id=forked_thread_id,
+                thread_id=forked_thread_id,
+                project_id=project_id,
+                cwd=result_cwd,
+                result_json=json.dumps(base_result, ensure_ascii=False),
+                last_error=None,
+                completed_at=None if has_initial_message else _now_iso(),
+                updated_at=_now_iso(),
+                next_attempt_at=None,
+                app_server_generation=generation,
+            )
+
+        if not has_initial_message:
+            return {
+                **base_result,
+                "status": "completed",
+                "phase": "completed",
+                "pollRecommended": False,
+                "nextRecommendedAction": "read_forked_thread",
+                "recommendedPollAfterSeconds": 0,
+            }
+
+        turn_args = dict(args)
+        turn_args["chat_id"] = forked_thread_id
+        turn_args["project_id"] = project_id
+        turn_args["_resolved_thread_id"] = forked_thread_id
+        turn_args["_resolved_project_path"] = result_cwd
+        turn_args["_skip_prompt_dedup"] = True
+        turn_args["_prompt_submission_id"] = None
+        turn_result = await self._send_message_resolved(
+            chat_id=forked_thread_id,
+            thread_id=forked_thread_id,
+            project_id=project_id,
+            project_path=result_cwd,
+            message=str(message or ""),
+            args=turn_args,
+            prompt_submission_id=None,
+            dedup_metadata=None,
+        )
+        turn_id = _optional_string(turn_result.get("turnId")) or _optional_string(turn_result.get("turn_id"))
+        fork_state["turnId"] = turn_id
+        combined = {
+            **turn_result,
+            "operationType": "fork_thread",
+            "sourceThreadId": source_thread_id,
+            "forkState": fork_state,
+            "forkResult": redact_payload(fork_result),
+            "appServerGeneration": turn_result.get("appServerGeneration") or generation,
+        }
+        if operation_id:
+            self.storage.update_operation(
+                operation_id,
+                result_json=json.dumps(combined, ensure_ascii=False),
+                updated_at=_now_iso(),
+                app_server_generation=combined.get("appServerGeneration") or generation,
+            )
+        return combined
+
     async def _send_message_resolved(
         self,
         *,
@@ -1068,6 +1796,7 @@ class ToolService:
         approval_policy = _approval_policy_for_send(args.get("approval_policy"), thread_row, self.config.default_approval_policy)
         sandbox_policy = _sandbox_policy_for_send(args.get("sandbox"), thread_row, self.config.default_sandbox_policy)
         collaboration_mode = _collaboration_mode(args.get("collaboration_mode"), model=None, config=self.config)
+        output_schema = args.get("_output_schema") if isinstance(args.get("_output_schema"), dict) else None
         client = await self._app()
         try:
             if prompt_submission_id:
@@ -1094,7 +1823,7 @@ class ToolService:
                 )
             result = await client.turn_start(
                 thread_id=thread_id,
-                input_items=[{"type": "text", "text": message}],
+                input_items=_turn_start_input_items(message, args),
                 cwd=project_path,
                 approval_policy=approval_policy,
                 sandbox_policy=sandbox_policy,
@@ -1102,6 +1831,7 @@ class ToolService:
                 effort=self.config.default_effort,
                 summary=self.config.default_summary,
                 collaboration_mode=collaboration_mode,
+                output_schema=output_schema,
                 chat_id=chat_id,
                 project_id=project_id,
                 project_path=project_path,
@@ -1182,6 +1912,9 @@ class ToolService:
             "updatedAt": status_payload.get("updatedAt") or status_payload.get("updated_at"),
             "note": UI_RELOAD_NOTE,
         }
+        input_item_state = args.get("_input_item_state")
+        if isinstance(input_item_state, dict):
+            response["inputItemState"] = dict(input_item_state)
         response.update(self._dedup_metadata_for_result(dedup_metadata))
         return response
 
@@ -1227,8 +1960,12 @@ class ToolService:
                 result = await self.codex_start_plan_workflow(args)
                 LOG.info("call done name=%s elapsed_ms=%d", name, int((time.monotonic() - started) * 1000))
                 return result
+            if name == "codex_start_review_workflow":
+                result = self.codex_start_review_workflow(args)
+                LOG.info("call done name=%s elapsed_ms=%d", name, int((time.monotonic() - started) * 1000))
+                return result
             if name == "codex_get_workflow_status":
-                result = self.codex_get_workflow_status(args)
+                result = await self.codex_get_workflow_status_async(args)
                 LOG.info("call done name=%s elapsed_ms=%d", name, int((time.monotonic() - started) * 1000))
                 return result
             if name == "codex_approve_plan":
@@ -1261,6 +1998,22 @@ class ToolService:
                 return result
             if name == "codex_interrupt_turn":
                 result = await self.codex_interrupt_turn(args)
+                LOG.info("call done name=%s elapsed_ms=%d", name, int((time.monotonic() - started) * 1000))
+                return result
+            if name == "codex_archive_thread":
+                result = await self.codex_archive_thread(args)
+                LOG.info("call done name=%s elapsed_ms=%d", name, int((time.monotonic() - started) * 1000))
+                return result
+            if name == "codex_unarchive_thread":
+                result = await self.codex_unarchive_thread(args)
+                LOG.info("call done name=%s elapsed_ms=%d", name, int((time.monotonic() - started) * 1000))
+                return result
+            if name == "codex_start_thread_compaction":
+                result = await self.codex_start_thread_compaction(args)
+                LOG.info("call done name=%s elapsed_ms=%d", name, int((time.monotonic() - started) * 1000))
+                return result
+            if name == "codex_get_thread_compaction_status":
+                result = self.codex_get_thread_compaction_status(args)
                 LOG.info("call done name=%s elapsed_ms=%d", name, int((time.monotonic() - started) * 1000))
                 return result
             if name == "codex_restart_app_server":
@@ -1771,6 +2524,7 @@ class ToolService:
         approval_policy = _approval_policy_for_start(args.get("approval_policy"), self.config.default_approval_policy)
         model = str(args.get("model")) if args.get("model") not in (None, "") else None
         collaboration_mode = _collaboration_mode(args.get("collaboration_mode"), model=model, config=self.config)
+        output_schema = args.get("_output_schema") if isinstance(args.get("_output_schema"), dict) else None
         try:
             if prompt_submission_id:
                 self.storage.update_prompt_submission(prompt_submission_id, status="starting_thread", project_id=project_id, updated_at=_now_iso())
@@ -1812,7 +2566,7 @@ class ToolService:
                 await client.thread_name_set(thread_id, str(args["title"]))
             result = await client.turn_start(
                 thread_id=thread_id,
-                input_items=[{"type": "text", "text": message}],
+                input_items=_turn_start_input_items(message, args),
                 cwd=cwd,
                 approval_policy=approval_policy,
                 sandbox_policy=sandbox_policy,
@@ -1820,6 +2574,7 @@ class ToolService:
                 effort=self.config.default_effort,
                 summary=self.config.default_summary,
                 collaboration_mode=collaboration_mode,
+                output_schema=output_schema,
                 chat_id=thread_id,
                 project_id=project_id,
                 project_path=cwd,
@@ -1898,6 +2653,9 @@ class ToolService:
             "updated_at": status_payload.get("updated_at"),
             "updatedAt": status_payload.get("updatedAt") or status_payload.get("updated_at"),
         }
+        input_item_state = args.get("_input_item_state")
+        if isinstance(input_item_state, dict):
+            response["inputItemState"] = dict(input_item_state)
         response.update(self._dedup_metadata_for_result(dedup_metadata))
         return response
 
@@ -1917,6 +2675,16 @@ class ToolService:
                 return status
 
         project_id = _required_string(args, "project_id")
+        goal_objective = _bounded_optional_text(args.get("goal"), field_name="goal", max_chars=20000)
+        goal_token_budget = _optional_bounded_int(args.get("goal_token_budget"), 1, 10000000, field_name="goal_token_budget")
+        goal_completion_action = _optional_string(args.get("goal_completion_action")) or "clear"
+        if goal_completion_action not in GOAL_COMPLETION_ACTIONS:
+            raise invalid_argument("Unsupported goal_completion_action.", goal_completion_action=goal_completion_action)
+        goal_completion_objective = _bounded_optional_text(
+            args.get("goal_completion_objective"),
+            field_name="goal_completion_objective",
+            max_chars=20000,
+        )
         workflow_id = "wf_" + uuid.uuid4().hex
         now = _now_iso()
         operation_args = {
@@ -1956,6 +2724,16 @@ class ToolService:
                 "latest_plan_hash": None,
                 "latest_report_hash": None,
                 "final_report_json": None,
+                "goal_objective": goal_objective,
+                "goal_token_budget": goal_token_budget,
+                "goal_completion_action": goal_completion_action,
+                "goal_completion_objective": goal_completion_objective,
+                "goal_sync_state": "pending_thread" if goal_objective else "not_configured",
+                "goal_app_server_json": None,
+                "goal_last_error": None,
+                "goal_last_synced_at": None,
+                "goal_cleared_at": None,
+                "goal_managed_hash": _workflow_goal_hash(goal_objective, goal_token_budget) if goal_objective else None,
                 "phase": "planning",
                 "status": "planning",
                 "last_error": None,
@@ -1967,6 +2745,7 @@ class ToolService:
                     {
                         "title": args.get("title"),
                         "startClientRequestId": client_request_id,
+                        "goalConfigured": bool(goal_objective),
                     },
                     ensure_ascii=False,
                 ),
@@ -1976,7 +2755,7 @@ class ToolService:
             workflow_id,
             event_type="workflow_started",
             message="Plan workflow queued.",
-            details={"planOperationId": plan_operation_id},
+            details={"planOperationId": plan_operation_id, "goalConfigured": bool(goal_objective)},
             created_at=now,
         )
         workflow = self.storage.get_workflow(workflow_id)
@@ -1991,6 +2770,174 @@ class ToolService:
         status["idempotent"] = False
         return status
 
+    def codex_start_review_workflow(self, args: dict[str, Any]) -> dict[str, Any]:
+        client_request_id = _optional_string(args.get("client_request_id"))
+        if client_request_id:
+            existing = self.storage.get_workflow_by_client_request_id(client_request_id)
+            if existing is not None:
+                status = self._workflow_status_payload(
+                    existing,
+                    last_messages=10,
+                    message_max_chars=_bounded_int(args.get("first_message_max_chars", 8000), 500, 200000),
+                    include_events=True,
+                )
+                status["idempotent"] = True
+                status["idempotencyScope"] = "start"
+                return status
+
+        target = _review_target_from_args(args)
+        requested_thread_id = _optional_string(args.get("thread_id"))
+        requested_project_id = _optional_string(args.get("project_id"))
+        cwd: str | None = None
+        source_thread_id: str | None = None
+        project_id: str | None = requested_project_id
+        source_known = False
+
+        if requested_thread_id:
+            context = self._resolve_lifecycle_thread_context(thread_id=requested_thread_id, project_id=project_id)
+            self._assert_thread_lifecycle_safe(requested_thread_id)
+            source_thread_id = requested_thread_id
+            project_id = _optional_string(context.get("projectId")) or project_id
+            cwd = canonical_existing_path(args.get("cwd") or context.get("projectPath"))
+            source_known = True
+        else:
+            if project_id:
+                project = self.catalog.get_project(project_id)
+                if project is None:
+                    raise project_not_found(project_id)
+                cwd = canonical_existing_path(args.get("cwd") or project.path)
+            else:
+                cwd_arg = _required_string(args, "cwd")
+                cwd = canonical_existing_path(cwd_arg)
+                project_id = project_id_for_path(cwd)
+            if not cwd:
+                raise invalid_argument("Review workflow requires thread_id or resolvable project_id/cwd.")
+
+        if not cwd or not is_allowed_path(cwd, self.config.allowed_roots):
+            raise invalid_argument("Requested cwd is outside the allowlist.", cwd=cwd or args.get("cwd"))
+        if not project_id:
+            project_id = project_id_for_path(cwd)
+
+        delivery = _optional_string(args.get("delivery"))
+        if not delivery:
+            delivery = "detached" if source_thread_id else "inline"
+        if delivery not in {"inline", "detached"}:
+            raise invalid_argument("Unsupported review delivery.", delivery=delivery)
+
+        workflow_id = "wf_" + uuid.uuid4().hex
+        operation_id = str(uuid.uuid4())
+        now = _now_iso()
+        approval_policy = args.get("approval_policy") or self.config.default_approval_policy
+        sandbox = args.get("sandbox") or _sandbox_value_from_policy(self.config.default_sandbox_policy)
+        request_payload = {
+            "operation_type": "review_start",
+            "workflow_id": workflow_id,
+            "project_id": project_id,
+            "thread_id": source_thread_id,
+            "cwd": cwd,
+            "target_type": args.get("target_type"),
+            "base_branch": _optional_string(args.get("base_branch")),
+            "commit_sha": _optional_string(args.get("commit_sha")),
+            "commit_title": _optional_string(args.get("commit_title")),
+            "instructions": _optional_string(args.get("instructions")),
+            "delivery": delivery,
+            "model": _optional_string(args.get("model")),
+            "sandbox": sandbox,
+            "approval_policy": approval_policy,
+            "timeout_seconds": args.get("timeout_seconds", DEFAULT_TOOL_START_TIMEOUT_SECONDS),
+            "_operation_id": operation_id,
+            "_review_target": target,
+            "_review_delivery": delivery,
+            "_review_source_thread_id": source_thread_id,
+            "_review_source_known": source_known,
+            "_resolved_project_path": cwd,
+        }
+        self.storage.create_operation(
+            {
+                "operation_id": operation_id,
+                "client_request_id": f"workflow:{workflow_id}:review",
+                "operation_type": "review_start",
+                "status": "queued",
+                "phase": "queued",
+                "project_id": project_id,
+                "chat_id": source_thread_id,
+                "thread_id": None,
+                "turn_id": None,
+                "workflow_id": workflow_id,
+                "cwd": cwd,
+                "title": None,
+                "request_json": json.dumps(request_payload, ensure_ascii=False, sort_keys=True),
+                "result_json": None,
+                "last_error": None,
+                "attempt_count": 0,
+                "created_at": now,
+                "updated_at": now,
+                "started_at": None,
+                "completed_at": None,
+                "app_server_generation": None,
+            }
+        )
+        self.storage.create_workflow(
+            {
+                "workflow_id": workflow_id,
+                "workflow_kind": "code_review",
+                "client_request_id": client_request_id,
+                "execution_client_request_id": None,
+                "current_operation_id": operation_id,
+                "plan_operation_id": None,
+                "execution_operation_id": None,
+                "review_operation_id": operation_id,
+                "review_source_thread_id": source_thread_id,
+                "review_thread_id": None,
+                "review_turn_id": None,
+                "review_target_json": json.dumps(target, ensure_ascii=False, sort_keys=True),
+                "review_delivery": delivery,
+                "project_id": project_id,
+                "thread_id": "",
+                "plan_turn_id": "",
+                "execution_turn_id": None,
+                "latest_plan_item_id": None,
+                "latest_plan_hash": None,
+                "latest_report_hash": None,
+                "final_report_json": None,
+                "phase": "queued",
+                "status": "queued",
+                "last_error": None,
+                "created_at": now,
+                "updated_at": now,
+                "completed_at": None,
+                "app_server_generation": None,
+                "metadata_json": json.dumps(
+                    {
+                        "startClientRequestId": client_request_id,
+                        "sourceThreadKnown": source_known,
+                    },
+                    ensure_ascii=False,
+                ),
+            }
+        )
+        self.storage.record_workflow_event(
+            workflow_id,
+            event_type="review_workflow_started",
+            message="Code review workflow queued.",
+            details={"reviewOperationId": operation_id, "delivery": delivery, "target": target},
+            created_at=now,
+        )
+        operation = self.storage.get_operation(operation_id)
+        if operation is not None:
+            self._schedule_operation_if_needed(operation)
+        workflow = self.storage.get_workflow(workflow_id)
+        assert workflow is not None
+        status = self._workflow_status_payload(
+            workflow,
+            last_messages=10,
+            message_max_chars=_bounded_int(args.get("first_message_max_chars", 8000), 500, 200000),
+            include_events=True,
+        )
+        status["reviewStartOperation"] = self._operation_status_payload(operation, last_messages=10, message_max_chars=8000) if operation else None
+        status["idempotent"] = False
+        return status
+
     def codex_get_workflow_status(self, args: dict[str, Any]) -> dict[str, Any]:
         workflow_id = _required_string(args, "workflow_id")
         workflow = self.storage.get_workflow(workflow_id)
@@ -2002,6 +2949,348 @@ class ToolService:
             message_max_chars=_bounded_int(args.get("message_max_chars", 8000), 500, 200000),
             include_events=bool(args.get("include_events", True)),
         )
+
+    async def codex_get_workflow_status_async(self, args: dict[str, Any]) -> dict[str, Any]:
+        workflow_id = _required_string(args, "workflow_id")
+        workflow = self.storage.get_workflow(workflow_id)
+        if workflow is None:
+            raise invalid_argument("Codex workflow was not found.", workflow_id=workflow_id)
+        last_messages = _bounded_int(args.get("last_messages", 10), 1, 50)
+        message_max_chars = _bounded_int(args.get("message_max_chars", 8000), 500, 200000)
+        include_events = bool(args.get("include_events", True))
+        result = self._workflow_status_payload(
+            workflow,
+            last_messages=last_messages,
+            message_max_chars=message_max_chars,
+            include_events=include_events,
+        )
+        if str(workflow.get("workflow_kind") or "") == "code_review":
+            return result
+        synced = await self._sync_workflow_goal_for_status(workflow_id, phase=str(result.get("phase") or ""))
+        if synced is not None:
+            result["threadGoal"] = self._workflow_goal_status(synced)
+            if include_events:
+                result["events"] = [_workflow_event_to_tool(row) for row in self.storage.list_workflow_events(workflow_id, limit=20)]
+        return result
+
+    async def _sync_workflow_goal_for_status(self, workflow_id: str, *, phase: str) -> dict[str, Any] | None:
+        workflow = self.storage.get_workflow(workflow_id)
+        if workflow is None:
+            return None
+        thread_id = _optional_string(workflow.get("thread_id"))
+        objective = _optional_string(workflow.get("goal_objective"))
+        if not thread_id:
+            if objective and workflow.get("goal_sync_state") != "pending_thread":
+                self.storage.update_workflow(workflow_id, goal_sync_state="pending_thread", goal_last_error=None, updated_at=_now_iso())
+                workflow = self.storage.get_workflow(workflow_id) or workflow
+            return workflow
+        if not objective:
+            return await self._observe_unmanaged_workflow_goal(workflow)
+        if phase == "completed" or workflow.get("phase") == "completed":
+            return await self._sync_completed_workflow_goal(workflow)
+        return await self._sync_active_workflow_goal(workflow)
+
+    async def _observe_unmanaged_workflow_goal(self, workflow: dict[str, Any]) -> dict[str, Any]:
+        workflow_id = str(workflow["workflow_id"])
+        thread_id = _optional_string(workflow.get("thread_id"))
+        if not thread_id or self._app_server is None or self._app_server.process is None or self._app_server.process.returncode is not None:
+            return workflow
+        try:
+            result = await self._app_server.thread_goal_get(thread_id, timeout_seconds=2)
+        except Exception as exc:
+            state = "unsupported" if _is_goal_unsupported_error(exc) else "error"
+            self._update_workflow_goal_state(
+                workflow_id,
+                goal_sync_state=state,
+                goal_last_error=redact_text(str(exc), max_chars=500),
+                event_type="goal_sync_unsupported" if state == "unsupported" else "goal_sync_failed",
+                event_message="Codex thread goal could not be read.",
+                event_details={"threadId": thread_id, "state": state},
+            )
+            return self.storage.get_workflow(workflow_id) or workflow
+        goal = _extract_thread_goal(result)
+        self.storage.update_workflow(
+            workflow_id,
+            goal_sync_state="observed" if goal is not None else "not_configured",
+            goal_app_server_json=_thread_goal_json(goal),
+            goal_last_error=None,
+            goal_last_synced_at=_now_iso(),
+            updated_at=_now_iso(),
+            app_server_generation=result.get("_processGeneration") or self._app_server.process_generation,
+        )
+        return self.storage.get_workflow(workflow_id) or workflow
+
+    async def _sync_active_workflow_goal(self, workflow: dict[str, Any]) -> dict[str, Any]:
+        workflow_id = str(workflow["workflow_id"])
+        thread_id = _optional_string(workflow.get("thread_id"))
+        objective = _optional_string(workflow.get("goal_objective"))
+        if not thread_id or not objective:
+            return workflow
+        state = str(workflow.get("goal_sync_state") or "not_configured")
+        token_budget = _optional_bounded_int(workflow.get("goal_token_budget"), 1, 10000000, field_name="goal_token_budget")
+        managed_hash = _optional_string(workflow.get("goal_managed_hash")) or _workflow_goal_hash(objective, token_budget)
+        if state == "external_override":
+            return workflow
+        if state == "error":
+            stored_goal = _workflow_goal_from_json(workflow.get("goal_app_server_json"))
+            if stored_goal is not None and _thread_goal_hash(stored_goal) == managed_hash:
+                self._update_workflow_goal_state(
+                    workflow_id,
+                    goal_sync_state="active",
+                    goal_app_server_json=_thread_goal_json(stored_goal),
+                    goal_last_error=None,
+                    goal_last_synced_at=_now_iso(),
+                    app_server_generation=workflow.get("app_server_generation"),
+                    event_type="goal_set_observed",
+                    event_message="Codex thread goal already matches MCP managed goal.",
+                    event_details={"threadId": thread_id, "tokenBudget": token_budget},
+                )
+                return self.storage.get_workflow(workflow_id) or workflow
+        client = await self._app()
+        if state == "error":
+            try:
+                result = await client.thread_goal_get(thread_id, timeout_seconds=2)
+            except Exception:
+                result = None
+            if isinstance(result, dict):
+                current = _extract_thread_goal(result)
+                current_hash = _thread_goal_hash(current)
+                if current is not None and current_hash == managed_hash:
+                    self._update_workflow_goal_state(
+                        workflow_id,
+                        goal_sync_state="active",
+                        goal_app_server_json=_thread_goal_json(current),
+                        goal_last_error=None,
+                        goal_last_synced_at=_now_iso(),
+                        app_server_generation=result.get("_processGeneration") or client.process_generation,
+                        event_type="goal_set_observed",
+                        event_message="Codex thread goal already matches MCP managed goal.",
+                        event_details={"threadId": thread_id, "tokenBudget": token_budget},
+                    )
+                    return self.storage.get_workflow(workflow_id) or workflow
+                if current is not None and current_hash and current_hash != managed_hash:
+                    self._update_workflow_goal_state(
+                        workflow_id,
+                        goal_sync_state="external_override",
+                        goal_app_server_json=_thread_goal_json(current),
+                        goal_last_error=None,
+                        goal_last_synced_at=_now_iso(),
+                        app_server_generation=result.get("_processGeneration") or client.process_generation,
+                        event_type="goal_external_override",
+                        event_message="Codex thread goal changed outside MCP management.",
+                        event_details={"threadId": thread_id},
+                    )
+                    return self.storage.get_workflow(workflow_id) or workflow
+        if state == "active":
+            try:
+                result = await client.thread_goal_get(thread_id, timeout_seconds=2)
+            except Exception as exc:
+                return self._mark_workflow_goal_error(workflow, exc, action="read")
+            current = _extract_thread_goal(result)
+            current_hash = _thread_goal_hash(current)
+            if current is not None and current_hash and current_hash != managed_hash:
+                self._update_workflow_goal_state(
+                    workflow_id,
+                    goal_sync_state="external_override",
+                    goal_app_server_json=_thread_goal_json(current),
+                    goal_last_error=None,
+                    goal_last_synced_at=_now_iso(),
+                    app_server_generation=result.get("_processGeneration") or client.process_generation,
+                    event_type="goal_external_override",
+                    event_message="Codex thread goal changed outside MCP management.",
+                    event_details={"threadId": thread_id},
+                )
+                return self.storage.get_workflow(workflow_id) or workflow
+            self.storage.update_workflow(
+                workflow_id,
+                goal_app_server_json=_thread_goal_json(current),
+                goal_last_error=None,
+                goal_last_synced_at=_now_iso(),
+                updated_at=_now_iso(),
+                app_server_generation=result.get("_processGeneration") or client.process_generation,
+            )
+            return self.storage.get_workflow(workflow_id) or workflow
+        try:
+            result = await client.thread_goal_set(
+                thread_id,
+                objective=objective,
+                status="active",
+                token_budget=token_budget,
+                timeout_seconds=5,
+            )
+        except Exception as exc:
+            return self._mark_workflow_goal_error(workflow, exc, action="set")
+        goal = _extract_thread_goal(result)
+        self._update_workflow_goal_state(
+            workflow_id,
+            goal_sync_state="active",
+            goal_app_server_json=_thread_goal_json(goal),
+            goal_last_error=None,
+            goal_last_synced_at=_now_iso(),
+            goal_cleared_at=None,
+            goal_managed_hash=managed_hash,
+            app_server_generation=result.get("_processGeneration") or client.process_generation,
+            event_type="goal_set",
+            event_message="Codex thread goal set for workflow.",
+            event_details={"threadId": thread_id, "tokenBudget": token_budget},
+        )
+        return self.storage.get_workflow(workflow_id) or workflow
+
+    async def _sync_completed_workflow_goal(self, workflow: dict[str, Any]) -> dict[str, Any]:
+        workflow_id = str(workflow["workflow_id"])
+        thread_id = _optional_string(workflow.get("thread_id"))
+        objective = _optional_string(workflow.get("goal_objective"))
+        if not thread_id or not objective:
+            return workflow
+        state = str(workflow.get("goal_sync_state") or "not_configured")
+        if state in {"cleared", "complete", "left", "external_override", "unsupported"}:
+            return workflow
+        if state not in {"active", "observed"}:
+            return workflow
+        completion_action = _optional_string(workflow.get("goal_completion_action")) or "clear"
+        if completion_action not in GOAL_COMPLETION_ACTIONS:
+            completion_action = "clear"
+        token_budget = _optional_bounded_int(workflow.get("goal_token_budget"), 1, 10000000, field_name="goal_token_budget")
+        managed_hash = _optional_string(workflow.get("goal_managed_hash")) or _workflow_goal_hash(objective, token_budget)
+        client = await self._app()
+        try:
+            current_result = await client.thread_goal_get(thread_id, timeout_seconds=2)
+        except Exception as exc:
+            return self._mark_workflow_goal_error(workflow, exc, action="read")
+        current = _extract_thread_goal(current_result)
+        current_hash = _thread_goal_hash(current)
+        if current is None:
+            self._update_workflow_goal_state(
+                workflow_id,
+                goal_sync_state="cleared",
+                goal_app_server_json=None,
+                goal_last_error=None,
+                goal_last_synced_at=_now_iso(),
+                goal_cleared_at=_now_iso(),
+                app_server_generation=current_result.get("_processGeneration") or client.process_generation,
+            )
+            return self.storage.get_workflow(workflow_id) or workflow
+        if current_hash and current_hash != managed_hash:
+            self._update_workflow_goal_state(
+                workflow_id,
+                goal_sync_state="external_override",
+                goal_app_server_json=_thread_goal_json(current),
+                goal_last_error=None,
+                goal_last_synced_at=_now_iso(),
+                app_server_generation=current_result.get("_processGeneration") or client.process_generation,
+                event_type="goal_external_override",
+                event_message="Codex thread goal changed outside MCP management; completion action skipped.",
+                event_details={"threadId": thread_id, "completionAction": completion_action},
+            )
+            return self.storage.get_workflow(workflow_id) or workflow
+        if completion_action == "leave":
+            self._update_workflow_goal_state(
+                workflow_id,
+                goal_sync_state="left",
+                goal_app_server_json=_thread_goal_json(current),
+                goal_last_error=None,
+                goal_last_synced_at=_now_iso(),
+                app_server_generation=current_result.get("_processGeneration") or client.process_generation,
+                event_type="goal_left",
+                event_message="Codex thread goal left unchanged after workflow completion.",
+                event_details={"threadId": thread_id},
+            )
+            return self.storage.get_workflow(workflow_id) or workflow
+        if completion_action == "set_complete":
+            completion_objective = _optional_string(workflow.get("goal_completion_objective")) or objective
+            try:
+                result = await client.thread_goal_set(
+                    thread_id,
+                    objective=completion_objective,
+                    status="complete",
+                    token_budget=token_budget,
+                    timeout_seconds=5,
+                )
+            except Exception as exc:
+                return self._mark_workflow_goal_error(workflow, exc, action="set_complete")
+            goal = _extract_thread_goal(result)
+            self._update_workflow_goal_state(
+                workflow_id,
+                goal_sync_state="complete",
+                goal_app_server_json=_thread_goal_json(goal),
+                goal_last_error=None,
+                goal_last_synced_at=_now_iso(),
+                goal_managed_hash=_workflow_goal_hash(completion_objective, token_budget),
+                app_server_generation=result.get("_processGeneration") or client.process_generation,
+                event_type="goal_completed",
+                event_message="Codex thread goal marked complete after workflow completion.",
+                event_details={"threadId": thread_id},
+            )
+            return self.storage.get_workflow(workflow_id) or workflow
+        try:
+            result = await client.thread_goal_clear(thread_id, timeout_seconds=5)
+        except Exception as exc:
+            return self._mark_workflow_goal_error(workflow, exc, action="clear")
+        self._update_workflow_goal_state(
+            workflow_id,
+            goal_sync_state="cleared",
+            goal_app_server_json=None,
+            goal_last_error=None,
+            goal_last_synced_at=_now_iso(),
+            goal_cleared_at=_now_iso(),
+            app_server_generation=result.get("_processGeneration") or client.process_generation,
+            event_type="goal_cleared",
+            event_message="Codex thread goal cleared after workflow completion.",
+            event_details={"threadId": thread_id, "cleared": bool(result.get("cleared", True))},
+        )
+        return self.storage.get_workflow(workflow_id) or workflow
+
+    def _mark_workflow_goal_error(self, workflow: dict[str, Any], exc: Exception, *, action: str) -> dict[str, Any]:
+        workflow_id = str(workflow["workflow_id"])
+        state = "unsupported" if _is_goal_unsupported_error(exc) else "error"
+        self._update_workflow_goal_state(
+            workflow_id,
+            goal_sync_state=state,
+            goal_last_error=redact_text(str(exc), max_chars=500),
+            event_type="goal_sync_unsupported" if state == "unsupported" else "goal_sync_failed",
+            event_message=f"Codex thread goal {action} failed.",
+            event_details={"action": action, "state": state},
+        )
+        return self.storage.get_workflow(workflow_id) or workflow
+
+    def _update_workflow_goal_state(
+        self,
+        workflow_id: str,
+        *,
+        event_type: str | None = None,
+        event_message: str | None = None,
+        event_details: dict[str, Any] | None = None,
+        **fields: Any,
+    ) -> None:
+        now = _now_iso()
+        update_fields = {**fields, "updated_at": now}
+        self.storage.update_workflow(workflow_id, **update_fields)
+        if event_type:
+            self.storage.record_workflow_event(
+                workflow_id,
+                event_type=event_type,
+                message=event_message or event_type,
+                details=event_details or {},
+                created_at=now,
+            )
+
+    def _workflow_goal_status(self, workflow: dict[str, Any]) -> dict[str, Any]:
+        objective = _optional_string(workflow.get("goal_objective"))
+        current_goal = _workflow_goal_from_json(workflow.get("goal_app_server_json"))
+        sync_state = str(workflow.get("goal_sync_state") or ("pending_thread" if objective else "not_configured"))
+        return {
+            "configured": bool(objective),
+            "managed": bool(objective) and sync_state in {"pending_thread", "active", "complete", "cleared", "left"},
+            "syncState": sync_state,
+            "completionAction": workflow.get("goal_completion_action") or "clear",
+            "desiredObjective": redact_text(objective, max_chars=1000) if objective else None,
+            "tokenBudget": workflow.get("goal_token_budget"),
+            "currentGoal": current_goal,
+            "lastSyncedAt": workflow.get("goal_last_synced_at"),
+            "clearedAt": workflow.get("goal_cleared_at"),
+            "lastError": workflow.get("goal_last_error"),
+            "available": sync_state != "unsupported",
+        }
 
     def codex_approve_plan(self, args: dict[str, Any]) -> dict[str, Any]:
         workflow_id = _required_string(args, "workflow_id")
@@ -2065,6 +3354,7 @@ class ToolService:
                 "sandbox": args.get("sandbox") or _sandbox_value_from_policy(self.config.default_sandbox_policy),
                 "timeout_seconds": args.get("timeout_seconds", DEFAULT_TOOL_START_TIMEOUT_SECONDS),
                 "first_message_max_chars": args.get("first_message_max_chars", 8000),
+                "output_schema": args.get("output_schema"),
             }
         )
         operation_id = str(operation.get("operationId") or "")
@@ -2149,6 +3439,7 @@ class ToolService:
         workflow_id = _optional_string(args.get("workflow_id"))
         if workflow_id and not args.get("_operation_id") and not args.get("_skip_prompt_dedup") and not bool(args.get("force", False)):
             return self.codex_approve_plan(args)
+        output_schema, output_schema_state = _validate_output_schema(args.get("output_schema"))
         workflow: dict[str, Any] | None = None
         if workflow_id:
             workflow = self.storage.get_workflow(workflow_id)
@@ -2193,6 +3484,11 @@ class ToolService:
         payload["collaboration_mode"] = "default"
         payload["_prompt_dedup_operation_type"] = "execute_plan"
         payload["_prompt_dedup_basis"] = self._prompt_dedup_basis("execute_plan", str(message), workflow=workflow)
+        if output_schema is not None and output_schema_state is not None:
+            payload["_output_schema"] = output_schema
+            payload["_output_schema_state"] = output_schema_state
+            payload["output_schema_hash"] = output_schema_state["schemaHash"]
+        payload.pop("output_schema", None)
         payload.pop("workflow_id", None)
         payload.pop("client_request_id", None)
         payload.pop("force", None)
@@ -2233,9 +3529,13 @@ class ToolService:
 
     def codex_submit_task(self, args: dict[str, Any]) -> dict[str, Any]:
         operation_type = _required_string(args, "operation_type")
-        if operation_type not in {"start_chat", "send_message", "execute_plan", "steer_turn"}:
+        if operation_type not in {"start_chat", "send_message", "execute_plan", "steer_turn", "fork_thread"}:
             raise invalid_argument("Unsupported operation_type", operation_type=operation_type)
-        message = _required_string(args, "message")
+        message: str | None
+        if operation_type == "fork_thread":
+            message = _optional_string(args.get("message"))
+        else:
+            message = _required_string(args, "message")
         explicit_client_request_id = _optional_string(args.get("client_request_id"))
         if explicit_client_request_id:
             existing = self.storage.get_operation_by_client_request_id(explicit_client_request_id)
@@ -2258,6 +3558,21 @@ class ToolService:
             raise invalid_argument("codex_submit_task execute_plan requires workflow_id or chat_id")
         if operation_type == "steer_turn" and not (_optional_string(args.get("thread_id")) and _optional_string(args.get("expected_turn_id"))):
             raise invalid_argument("codex_submit_task steer_turn requires thread_id and expected_turn_id")
+        if operation_type == "fork_thread" and not _optional_string(args.get("source_thread_id")):
+            raise invalid_argument("codex_submit_task fork_thread requires source_thread_id")
+        if operation_type == "fork_thread" and args.get("fork_config") is not None and not isinstance(args.get("fork_config"), dict):
+            raise invalid_argument("fork_config must be an object when provided.")
+        if operation_type == "steer_turn" and args.get("output_schema") is not None:
+            raise invalid_argument("codex_submit_task steer_turn does not support output_schema.")
+        if operation_type == "fork_thread" and args.get("output_schema") is not None and not _optional_string(message):
+            raise invalid_argument("codex_submit_task fork_thread output_schema requires an initial message.")
+        input_items_raw = args.get("input_items")
+        input_items_provided = input_items_raw not in (None, "")
+        if operation_type == "steer_turn" and input_items_provided:
+            raise invalid_argument("codex_submit_task steer_turn does not support input_items.")
+        if operation_type == "fork_thread" and input_items_provided and not _optional_string(message):
+            raise invalid_argument("codex_submit_task fork_thread input_items requires an initial message.")
+        output_schema, output_schema_state = _validate_output_schema(args.get("output_schema"))
 
         now = _now_iso()
         operation_id = str(uuid.uuid4())
@@ -2274,6 +3589,7 @@ class ToolService:
         initial_thread_id: str | None = None
         project_id: str | None = _optional_string(args.get("project_id"))
         project_path: str | None = None
+        input_item_state: dict[str, Any] | None = None
 
         if operation_type == "steer_turn":
             initial_thread_id = _required_string(args, "thread_id")
@@ -2288,6 +3604,23 @@ class ToolService:
             actual_args["_resolved_thread_id"] = initial_thread_id
             actual_args["_target_turn_id"] = expected_turn_id
             actual_args["_client_user_message_id"] = f"mcp-steer:{operation_id}"
+        elif operation_type == "fork_thread":
+            source_thread_id = _required_string(args, "source_thread_id")
+            fork_source = self._resolve_fork_source_context(
+                source_thread_id=source_thread_id,
+                cwd=args.get("cwd"),
+                project_id=project_id,
+            )
+            project_id = _optional_string(fork_source.get("projectId"))
+            project_path = _optional_string(fork_source.get("projectPath"))
+            initial_chat_id = None
+            initial_thread_id = None
+            actual_args["source_thread_id"] = source_thread_id
+            actual_args["project_id"] = project_id
+            actual_args["cwd"] = project_path
+            actual_args["_source_chat_id"] = fork_source.get("chatId")
+            actual_args["_source_known"] = fork_source.get("sourceKnown")
+            actual_args["_resolved_project_path"] = project_path
         elif operation_type == "start_chat":
             project = self.catalog.get_project(str(project_id))
             if project is None:
@@ -2334,24 +3667,39 @@ class ToolService:
                 actual_args["_resolved_thread_id"] = initial_thread_id
                 actual_args["_resolved_project_path"] = project_path
 
+        if input_items_provided:
+            normalized_input_items, input_item_state = self._normalize_turn_input_items(
+                message=str(message or ""),
+                raw_items=input_items_raw,
+                cwd=str(project_path or ""),
+            )
+            actual_args["_input_items"] = normalized_input_items
+            actual_args["_input_item_state"] = input_item_state
+            actual_args.pop("input_items", None)
+
         dedup: dict[str, Any] = {"action": "not_applicable"}
         prompt_submission_id: str | None = None
         dedup_metadata: dict[str, Any] | None = None
-        if operation_type != "steer_turn":
+        if operation_type not in {"steer_turn", "fork_thread"}:
             dedup_basis = str(args.get("_prompt_dedup_basis") or self._prompt_dedup_basis(operation_type, message, workflow=workflow))
+            if output_schema_state is not None:
+                dedup_basis = f"{dedup_basis}\noutput_schema:{output_schema_state['schemaHash']}"
+            if input_item_state is not None:
+                dedup_basis = f"{dedup_basis}\ninput_items:{input_item_state['dedupHash']}"
             dedup = self._prepare_prompt_submission(
                 project_id=project_id,
                 project_path_key=path_key(project_path),
                 operation_type=operation_type,
-                message=message,
+                message=str(message or ""),
                 dedup_basis=dedup_basis,
                 operation_id=operation_id,
                 chat_id=initial_chat_id,
                 thread_id=initial_thread_id,
                 workflow_id=_optional_string(args.get("workflow_id")),
+                strict_hash_only=input_item_state is not None,
             )
             prompt_submission_id = _optional_string(dedup.get("promptSubmissionId"))
-        if operation_type != "steer_turn" and dedup.get("action") == "continue_existing_chat":
+        if operation_type not in {"steer_turn", "fork_thread"} and dedup.get("action") == "continue_existing_chat":
             actual_operation_type = "send_message"
             existing_chat_id = _optional_string(dedup.get("existingChatId")) or _optional_string(dedup.get("existingThreadId"))
             existing_thread_id = _optional_string(dedup.get("existingThreadId")) or existing_chat_id
@@ -2380,10 +3728,22 @@ class ToolService:
         if operation_type == "execute_plan":
             actual_args["_prompt_dedup_operation_type"] = "execute_plan"
             actual_args["_prompt_dedup_basis"] = dedup_basis
+        if output_schema is not None and output_schema_state is not None:
+            actual_args["_output_schema"] = output_schema
+            actual_args["_output_schema_state"] = output_schema_state
+            actual_args["output_schema_hash"] = output_schema_state["schemaHash"]
+            actual_args.pop("output_schema", None)
 
         request_payload = _operation_request_payload(actual_args, operation_type=actual_operation_type, message=message)
         request_payload["_skip_prompt_dedup"] = True
         request_payload["_prompt_submission_id"] = prompt_submission_id
+        if output_schema is not None and output_schema_state is not None:
+            request_payload["_output_schema"] = output_schema
+            request_payload["_output_schema_state"] = output_schema_state
+            request_payload["output_schema_hash"] = output_schema_state["schemaHash"]
+        if input_item_state is not None:
+            request_payload["_input_items"] = actual_args.get("_input_items")
+            request_payload["_input_item_state"] = input_item_state
         if actual_args.get("_resolved_thread_id"):
             request_payload["_resolved_thread_id"] = actual_args.get("_resolved_thread_id")
         if actual_args.get("_resolved_project_path"):
@@ -2538,6 +3898,46 @@ class ToolService:
                 payload["_resolved_thread_id"] = operation.get("thread_id")
                 if operation.get("cwd"):
                     payload["_resolved_project_path"] = operation.get("cwd")
+            if operation_type == "fork_thread" and _optional_string(operation.get("thread_id")):
+                payload["_resolved_thread_id"] = operation.get("thread_id")
+                payload["chat_id"] = operation.get("thread_id")
+                if operation.get("cwd"):
+                    payload["cwd"] = operation.get("cwd")
+                    payload["_resolved_project_path"] = operation.get("cwd")
+                if not _optional_string(payload.get("message")):
+                    fork_state = {
+                        "accepted": True,
+                        "sourceThreadId": payload.get("source_thread_id"),
+                        "forkedThreadId": operation.get("thread_id"),
+                        "hasInitialMessage": False,
+                        "cwd": operation.get("cwd") or payload.get("cwd"),
+                        "model": payload.get("model"),
+                        "ephemeral": bool(payload.get("ephemeral", False)),
+                        "turnId": None,
+                    }
+                    self.storage.update_operation(
+                        operation_id,
+                        status="completed",
+                        phase="completed",
+                        result_json=json.dumps({"ok": True, "operationType": "fork_thread", "forkState": fork_state}, ensure_ascii=False),
+                        last_error=None,
+                        completed_at=_now_iso(),
+                        updated_at=_now_iso(),
+                        next_attempt_at=None,
+                    )
+                    LOG.info(
+                        "operation fork recovered completed operation_id=%s thread_id=%s",
+                        operation_id,
+                        operation.get("thread_id"),
+                    )
+                    return
+            if operation_type == "review_start" and payload.get("_review_start_attempted") and not _optional_string(operation.get("turn_id")):
+                self._mark_review_start_unknown_after_attempt(
+                    operation,
+                    reason="MCP server restarted after review/start attempt before review turn id was persisted.",
+                )
+                LOG.info("operation review marked unknown after attempted review/start operation_id=%s", operation_id)
+                return
             LOG.info("operation run start operation_id=%s type=%s", operation_id, operation_type)
             self.storage.update_operation(operation_id, status="starting_app_server", phase="starting_app_server", updated_at=_now_iso())
             if prompt_submission_id:
@@ -2551,6 +3951,28 @@ class ToolService:
                     message=str(payload.get("message") or ""),
                     args=_operation_tool_args(payload),
                 )
+            elif operation_type == "fork_thread":
+                result = await self._fork_thread_resolved(
+                    source_thread_id=_required_string(payload, "source_thread_id"),
+                    message=_optional_string(payload.get("message")),
+                    args=_operation_tool_args(payload),
+                )
+                LOG.info(
+                    "operation fork accepted operation_id=%s thread_id=%s turn_id=%s",
+                    operation_id,
+                    result.get("threadId") or result.get("thread_id"),
+                    result.get("turnId") or result.get("turn_id"),
+                )
+                return
+            elif operation_type == "review_start":
+                result = await self._review_start_resolved(args=_operation_tool_args(payload))
+                LOG.info(
+                    "operation review accepted operation_id=%s thread_id=%s turn_id=%s",
+                    operation_id,
+                    result.get("threadId") or result.get("thread_id"),
+                    result.get("turnId") or result.get("turn_id"),
+                )
+                return
             else:
                 self.storage.update_operation(operation_id, status="starting_thread", phase="starting_thread", updated_at=_now_iso())
                 if prompt_submission_id:
@@ -2650,6 +4072,11 @@ class ToolService:
                     next_attempt_at=None,
                 )
                 self.storage.update_prompt_submission_by_operation(operation_id, status="running", updated_at=_now_iso())
+            elif str(current.get("operation_type") or "") == "review_start" and _operation_review_start_attempted(current):
+                self._mark_review_start_unknown_after_attempt(
+                    current,
+                    reason="MCP server shut down after review/start attempt before review turn id was persisted.",
+                )
             else:
                 self.storage.update_operation(
                     operation_id,
@@ -2674,6 +4101,25 @@ class ToolService:
                     next_attempt_at=None,
                 )
                 self.storage.update_prompt_submission_by_operation(operation_id, status="running", updated_at=_now_iso())
+            elif (
+                str(current.get("operation_type") or "") == "review_start"
+                and _operation_review_start_attempted(current)
+                and _review_start_error_is_ambiguous(exc)
+            ):
+                self._mark_review_start_unknown_after_attempt(
+                    current,
+                    reason=f"Worker lost certainty after review/start attempt: {redact_text(str(exc), max_chars=500)}",
+                )
+            elif str(current.get("operation_type") or "") == "review_start" and _operation_review_start_attempted(current):
+                self.storage.update_operation(
+                    operation_id,
+                    status="failed",
+                    phase="failed",
+                    last_error=redact_text(str(exc), max_chars=500),
+                    updated_at=_now_iso(),
+                    completed_at=_now_iso(),
+                    next_attempt_at=None,
+                )
             else:
                 attempt_count = int(current.get("attempt_count") or 0)
                 max_attempts = int(current.get("max_attempts") or 3)
@@ -2781,6 +4227,21 @@ class ToolService:
         if not pending_interactions:
             pending_interactions = (turn_status or {}).get("pendingInteractions") or []
         response["pendingInteractions"] = pending_interactions
+        final_report = self._operation_final_report(
+            latest,
+            turn_status=turn_status,
+            message_max_chars=message_max_chars,
+        )
+        if final_report is not None:
+            response["finalReport"] = final_report
+            refreshed = self.storage.get_operation(operation_id) or latest
+            response["latestReportHash"] = refreshed.get("latest_report_hash")
+            output_schema_state = response.get("outputSchemaState")
+            if isinstance(output_schema_state, dict):
+                updated_schema_state = dict(output_schema_state)
+                updated_schema_state["parseStatus"] = final_report.get("structuredParseStatus")
+                updated_schema_state["structuredStatus"] = final_report.get("structuredStatus")
+                response["outputSchemaState"] = updated_schema_state
         pending_can_drive_operation = not (
             str(response.get("operationType") or "") == "steer_turn"
             and str(response.get("status") or "") in OPERATION_STARTABLE_STATUSES
@@ -2802,6 +4263,49 @@ class ToolService:
                 for row in self.storage.list_app_server_events(thread_id=thread_id, turn_id=turn_id, limit=50)
             ]
         return response
+
+    def _operation_final_report(
+        self,
+        operation: dict[str, Any],
+        *,
+        turn_status: dict[str, Any] | None,
+        message_max_chars: int,
+    ) -> dict[str, Any] | None:
+        stored: dict[str, Any] | None = None
+        try:
+            loaded = json.loads(str(operation.get("final_report_json") or "null"))
+            if isinstance(loaded, dict):
+                stored = loaded
+        except json.JSONDecodeError:
+            stored = None
+        request_payload = _operation_request_from_row(operation)
+        output_schema_state = request_payload.get("_output_schema_state") if isinstance(request_payload.get("_output_schema_state"), dict) else None
+        schema_hash = _optional_string((output_schema_state or {}).get("schemaHash")) or _optional_string(request_payload.get("output_schema_hash"))
+        final_text = _optional_string((turn_status or {}).get("finalMessage")) or _optional_string((turn_status or {}).get("final_message"))
+        if turn_status is not None and str(turn_status.get("status") or "") == "completed" and final_text:
+            report_hash, report_json = _stored_final_report_json(
+                final_text=final_text,
+                thread_id=(turn_status or {}).get("threadId") or operation.get("thread_id"),
+                turn_id=(turn_status or {}).get("turnId") or operation.get("turn_id"),
+                source=(turn_status or {}).get("source") or "storage",
+                schema_hash=schema_hash,
+            )
+            if report_hash != operation.get("latest_report_hash") or stored is None:
+                self.storage.update_operation(
+                    str(operation["operation_id"]),
+                    latest_report_hash=report_hash,
+                    final_report_json=report_json,
+                    updated_at=_now_iso(),
+                )
+            try:
+                stored = json.loads(report_json)
+            except json.JSONDecodeError:
+                stored = None
+            if stored is not None:
+                return _report_for_status(stored, message_max_chars=message_max_chars)
+        if stored is None:
+            return None
+        return _report_for_status(stored, message_max_chars=message_max_chars)
 
     def _operation_lease_state(self, operation: dict[str, Any]) -> dict[str, Any]:
         owner = _optional_string(operation.get("lease_owner"))
@@ -2925,7 +4429,9 @@ class ToolService:
             }
             for message in self.storage.get_last_tracked_turn_messages(turn_id, last_messages)
         ]
-        completion_observed = turn["status"] in {"completed", "failed", "aborted", "cancelled", "canceled", "interrupted"}
+        final_message = _truncate_text(turn.get("final_message"), message_max_chars)[0]
+        status_value = _turn_status_with_final_message(turn["status"], final_message)
+        completion_observed = status_value in {"completed", "failed", "aborted", "cancelled", "canceled", "interrupted"}
         last_error = _tracked_turn_last_error(turn)
         plans = [_plan_row_to_tool(row, message_max_chars) for row in self.storage.get_tracked_turn_plans(turn_id)]
         latest_plan = _latest_plan(plans)
@@ -2939,7 +4445,7 @@ class ToolService:
             "chatId": turn.get("chat_id"),
             "project_id": turn.get("project_id"),
             "projectId": turn.get("project_id"),
-            "status": turn["status"],
+            "status": status_value,
             "completion_observed": completion_observed,
             "completionObserved": completion_observed,
             "started_at": turn.get("started_at"),
@@ -2955,8 +4461,8 @@ class ToolService:
             "requestId": turn.get("request_id"),
             "processGeneration": turn.get("process_generation"),
             "lastError": last_error,
-            "final_message": _truncate_text(turn.get("final_message"), message_max_chars)[0],
-            "finalMessage": _truncate_text(turn.get("final_message"), message_max_chars)[0],
+            "final_message": final_message,
+            "finalMessage": final_message,
             "plans": plans,
             "latestPlan": latest_plan,
             "pending_interactions": [
@@ -3122,9 +4628,16 @@ class ToolService:
         message_max_chars: int,
         include_events: bool,
     ) -> dict[str, Any]:
-        workflow = self._sync_workflow_state(workflow, last_messages=last_messages, message_max_chars=message_max_chars)
         workflow_id = str(workflow["workflow_id"])
         workflow_kind = _optional_string(workflow.get("workflow_kind")) or "plan_then_execute"
+        if workflow_kind == "code_review":
+            return self._review_workflow_status_payload(
+                workflow,
+                last_messages=last_messages,
+                message_max_chars=message_max_chars,
+                include_events=include_events,
+            )
+        workflow = self._sync_workflow_state(workflow, last_messages=last_messages, message_max_chars=message_max_chars)
         thread_id = _optional_string(workflow.get("thread_id"))
         plan_turn_id = _optional_string(workflow.get("plan_turn_id"))
         execution_turn_id = _optional_string(workflow.get("execution_turn_id"))
@@ -3153,7 +4666,32 @@ class ToolService:
             if execution_turn_id
             else None
         )
-        plans = [_plan_row_to_tool(row, message_max_chars) for row in self.storage.get_tracked_turn_plans(plan_turn_id)] if plan_turn_id else []
+        plan_rows = self.storage.get_tracked_turn_plans(plan_turn_id) if plan_turn_id else []
+        if plan_turn_id and not plan_rows and str((plan_turn or {}).get("status") or "") == "completed":
+            fallback_plan = self._fallback_plan_text_for_completed_turn(
+                turn_id=plan_turn_id,
+                thread_id=thread_id,
+                turn_status=plan_turn,
+                max_chars=message_max_chars,
+            )
+            if fallback_plan:
+                now = _now_iso()
+                self.storage.upsert_tracked_plan_item(
+                    {
+                        "item_id": f"{plan_turn_id}:assistant-final-plan",
+                        "turn_id": plan_turn_id,
+                        "thread_id": thread_id,
+                        "status": "completed",
+                        "text": fallback_plan,
+                        "created_at": (plan_turn or {}).get("completedAt") or now,
+                        "updated_at": now,
+                        "completed_at": (plan_turn or {}).get("completedAt") or now,
+                        "sequence": 0,
+                        "payload_json": json.dumps({"source": "assistant_final_message_fallback"}, ensure_ascii=False),
+                    }
+                )
+                plan_rows = self.storage.get_tracked_turn_plans(plan_turn_id)
+        plans = [_plan_row_to_tool(row, message_max_chars) for row in plan_rows] if plan_turn_id else []
         latest_plan = _latest_plan(plans)
         plan_updates: dict[str, Any] = {}
         if latest_plan is not None:
@@ -3265,6 +4803,7 @@ class ToolService:
             "plans": plans,
             "latestPlan": latest_plan,
             "finalReport": final_report,
+            "threadGoal": self._workflow_goal_status(workflow),
             "pendingInteractions": pending_interactions,
             "nextRecommendedAction": _next_workflow_action(phase),
             "recommendedPollAfterSeconds": _workflow_poll_seconds(phase),
@@ -3318,6 +4857,43 @@ class ToolService:
             workflow = self.storage.get_workflow(workflow_id) or workflow
         return workflow
 
+    def _fallback_plan_text_for_completed_turn(
+        self,
+        *,
+        turn_id: str,
+        thread_id: str | None,
+        turn_status: dict[str, Any] | None,
+        max_chars: int,
+    ) -> str | None:
+        stored_turn = self.storage.get_tracked_turn(turn_id)
+        candidates: list[Any] = [
+            (stored_turn or {}).get("final_message"),
+            (turn_status or {}).get("finalMessage"),
+            (turn_status or {}).get("final_message"),
+        ]
+        for message in (turn_status or {}).get("latestMessages") or (turn_status or {}).get("last_messages") or []:
+            if isinstance(message, dict) and message.get("role") == "assistant":
+                candidates.append(message.get("text"))
+        if thread_id:
+            try:
+                chat = self.codex_get_chat(
+                    {
+                        "chat_id": thread_id,
+                        "message_limit": 20,
+                        "message_max_chars": max(4000, min(max_chars, 50_000)),
+                    }
+                )
+            except Exception:
+                chat = {}
+            for message in chat.get("messages") or []:
+                if isinstance(message, dict) and message.get("role") == "assistant":
+                    candidates.append(message.get("text"))
+        for candidate in reversed(candidates):
+            text = _optional_string(candidate)
+            if text:
+                return _truncate_text(text, max_chars)[0]
+        return None
+
     def _workflow_final_report(
         self,
         workflow: dict[str, Any],
@@ -3334,41 +4910,377 @@ class ToolService:
         except json.JSONDecodeError:
             stored = None
 
+        execution_operation_id = _optional_string(workflow.get("execution_operation_id"))
+        execution_operation = self.storage.get_operation(execution_operation_id) if execution_operation_id else None
+        request_payload = _operation_request_from_row(execution_operation) if execution_operation is not None else {}
+        output_schema_state = request_payload.get("_output_schema_state") if isinstance(request_payload.get("_output_schema_state"), dict) else None
+        schema_hash = _optional_string((output_schema_state or {}).get("schemaHash")) or _optional_string(request_payload.get("output_schema_hash"))
         final_text = _optional_string((execution_turn or {}).get("finalMessage")) or _optional_string((execution_turn or {}).get("final_message"))
         if execution_turn is not None and str(execution_turn.get("status") or "") == "completed" and final_text:
-            report_hash = prompt_hash(normalize_prompt(final_text))
-            truncated, budget = _truncate_text(final_text, message_max_chars)
-            report = {
-                "text": truncated,
-                "summary": truncated,
-                "truncated": bool(budget.get("truncated")),
-                "originalChars": budget.get("original_chars"),
-                "returnedChars": budget.get("returned_chars"),
-                "threadId": execution_turn.get("threadId") or workflow.get("thread_id"),
-                "turnId": execution_turn.get("turnId") or workflow.get("execution_turn_id"),
-                "source": execution_turn.get("source") or "storage",
-                "readFullVia": "codex_get_chat",
-            }
+            report_hash, report_json = _stored_final_report_json(
+                final_text=final_text,
+                thread_id=execution_turn.get("threadId") or workflow.get("thread_id"),
+                turn_id=execution_turn.get("turnId") or workflow.get("execution_turn_id"),
+                source=execution_turn.get("source") or "storage",
+                schema_hash=schema_hash,
+            )
             if report_hash != workflow.get("latest_report_hash") or stored is None:
                 self.storage.update_workflow(
                     workflow_id,
                     latest_report_hash=report_hash,
-                    final_report_json=json.dumps({"text": final_text, **{k: v for k, v in report.items() if k != "text"}}, ensure_ascii=False),
+                    final_report_json=report_json,
                     updated_at=_now_iso(),
                 )
-            return report
+            try:
+                stored = json.loads(report_json)
+            except json.JSONDecodeError:
+                stored = None
+            if stored is not None:
+                return _report_for_status(stored, message_max_chars=message_max_chars)
 
         if stored is None:
             return None
-        text = _optional_string(stored.get("text"))
-        truncated, budget = _truncate_text(text, message_max_chars)
-        restored = dict(stored)
-        restored["text"] = truncated
-        restored["summary"] = truncated
-        restored["truncated"] = bool(budget.get("truncated"))
-        restored["originalChars"] = budget.get("original_chars")
-        restored["returnedChars"] = budget.get("returned_chars")
-        return restored
+        return _report_for_status(stored, message_max_chars=message_max_chars)
+
+    def _sync_review_workflow_state(self, workflow: dict[str, Any]) -> dict[str, Any]:
+        workflow_id = str(workflow["workflow_id"])
+        updates: dict[str, Any] = {}
+        review_operation_id = _optional_string(workflow.get("review_operation_id")) or _optional_string(workflow.get("current_operation_id"))
+        review_operation = self.storage.get_operation(review_operation_id) if review_operation_id else None
+        if review_operation is not None:
+            self._schedule_operation_if_needed(review_operation)
+            request_payload = _operation_request_from_row(review_operation)
+            source_thread_id = _optional_string(request_payload.get("_review_source_thread_id")) or _optional_string(request_payload.get("thread_id"))
+            review_thread_id = _optional_string(review_operation.get("thread_id"))
+            review_turn_id = _optional_string(review_operation.get("turn_id"))
+            if review_operation_id and review_operation_id != _optional_string(workflow.get("review_operation_id")):
+                updates["review_operation_id"] = review_operation_id
+            if review_operation_id and review_operation_id != _optional_string(workflow.get("current_operation_id")):
+                updates["current_operation_id"] = review_operation_id
+            if source_thread_id and source_thread_id != _optional_string(workflow.get("review_source_thread_id")):
+                updates["review_source_thread_id"] = source_thread_id
+            if review_thread_id and review_thread_id != _optional_string(workflow.get("review_thread_id")):
+                updates["review_thread_id"] = review_thread_id
+                updates["thread_id"] = review_thread_id
+            if review_turn_id and review_turn_id != _optional_string(workflow.get("review_turn_id")):
+                updates["review_turn_id"] = review_turn_id
+            target = request_payload.get("_review_target") if isinstance(request_payload.get("_review_target"), dict) else None
+            if target and not _optional_string(workflow.get("review_target_json")):
+                updates["review_target_json"] = json.dumps(target, ensure_ascii=False, sort_keys=True)
+            delivery = _optional_string(request_payload.get("_review_delivery")) or _optional_string(request_payload.get("delivery"))
+            if delivery and delivery != _optional_string(workflow.get("review_delivery")):
+                updates["review_delivery"] = delivery
+        if updates:
+            updates["updated_at"] = _now_iso()
+            self.storage.update_workflow(workflow_id, **updates)
+            workflow = self.storage.get_workflow(workflow_id) or workflow
+        return workflow
+
+    def _review_workflow_status_payload(
+        self,
+        workflow: dict[str, Any],
+        *,
+        last_messages: int,
+        message_max_chars: int,
+        include_events: bool,
+    ) -> dict[str, Any]:
+        workflow = self._sync_review_workflow_state(workflow)
+        workflow_id = str(workflow["workflow_id"])
+        review_operation_id = _optional_string(workflow.get("review_operation_id")) or _optional_string(workflow.get("current_operation_id"))
+        review_source_thread_id = _optional_string(workflow.get("review_source_thread_id"))
+        review_thread_id = _optional_string(workflow.get("review_thread_id")) or _optional_string(workflow.get("thread_id"))
+        review_turn_id = _optional_string(workflow.get("review_turn_id"))
+        review_operation_row = self.storage.get_operation(review_operation_id) if review_operation_id else None
+        review_operation = (
+            self._operation_status_payload(review_operation_row, last_messages=last_messages, message_max_chars=message_max_chars)
+            if review_operation_row is not None
+            else None
+        )
+        workflow = self._sync_review_workflow_state(self.storage.get_workflow(workflow_id) or workflow)
+        review_source_thread_id = _optional_string(workflow.get("review_source_thread_id")) or review_source_thread_id
+        review_thread_id = _optional_string(workflow.get("review_thread_id")) or _optional_string(workflow.get("thread_id")) or review_thread_id
+        review_turn_id = _optional_string(workflow.get("review_turn_id")) or _optional_string((review_operation or {}).get("turnId")) or review_turn_id
+        review_turn = (
+            self._turn_status_or_none(review_turn_id, review_thread_id, last_messages=last_messages, message_max_chars=message_max_chars)
+            if review_turn_id
+            else None
+        )
+        pending_thread_id = review_thread_id or review_source_thread_id
+        pending_interactions = (
+            self._pending_interactions_for_context(thread_id=pending_thread_id, turn_id=review_turn_id, status="pending", limit=20)
+            if pending_thread_id
+            else []
+        )
+        final_report = self._review_workflow_final_report(
+            workflow,
+            review_turn=review_turn,
+            message_max_chars=message_max_chars,
+        )
+        workflow = self.storage.get_workflow(workflow_id) or workflow
+        refreshed_review_turn_id = _optional_string(workflow.get("review_turn_id"))
+        if refreshed_review_turn_id and refreshed_review_turn_id != review_turn_id:
+            review_turn_id = refreshed_review_turn_id
+            review_thread_id = _optional_string(workflow.get("review_thread_id")) or _optional_string(workflow.get("thread_id")) or review_thread_id
+            review_turn = self._turn_status_or_none(
+                review_turn_id,
+                review_thread_id,
+                last_messages=last_messages,
+                message_max_chars=message_max_chars,
+            )
+        review_operation_row = self.storage.get_operation(review_operation_id) if review_operation_id else None
+        review_operation = (
+            self._operation_status_payload(review_operation_row, last_messages=last_messages, message_max_chars=message_max_chars)
+            if review_operation_row is not None
+            else review_operation
+        )
+        phase, status, last_error = _derive_review_workflow_phase(
+            workflow,
+            review_turn=review_turn,
+            review_operation=review_operation,
+            pending_interactions=pending_interactions,
+        )
+        now = _now_iso()
+        completed_at = workflow.get("completed_at")
+        if status in {"completed", "failed", "unknown_after_app_server_exit", "interrupted", "cancelled", "canceled"} and not completed_at:
+            completed_at = now
+        if phase != workflow.get("phase") or status != workflow.get("status") or last_error != workflow.get("last_error"):
+            self.storage.update_workflow(
+                workflow_id,
+                phase=phase,
+                status=status,
+                last_error=last_error,
+                updated_at=now,
+                completed_at=completed_at,
+                current_operation_id=review_operation_id,
+                app_server_generation=self._app_server.process_generation if self._app_server is not None else workflow.get("app_server_generation"),
+            )
+            self.storage.record_workflow_event(
+                workflow_id,
+                event_type="review_workflow_status_changed",
+                message=f"Review workflow moved to {phase}.",
+                details={"phase": phase, "status": status, "lastError": last_error},
+                created_at=now,
+            )
+            workflow = self.storage.get_workflow(workflow_id) or workflow
+        review_target = _workflow_review_target(workflow)
+        sources = [str(item.get("source") or "") for item in (review_turn,) if isinstance(item, dict)]
+        source = "live" if "live" in sources else ("hook_history" if "hook_history" in sources else "storage")
+        staleness = _min_staleness(
+            [
+                workflow.get("updated_at"),
+                (review_turn or {}).get("updatedAt") or (review_turn or {}).get("updated_at") if review_turn else None,
+                (review_operation or {}).get("updatedAt") if review_operation else None,
+            ]
+        )
+        result = {
+            "ok": True,
+            "workflow_id": workflow_id,
+            "workflowId": workflow_id,
+            "workflow_kind": "code_review",
+            "workflowKind": "code_review",
+            "project_id": workflow.get("project_id"),
+            "projectId": workflow.get("project_id"),
+            "thread_id": review_thread_id,
+            "threadId": review_thread_id,
+            "review_source_thread_id": review_source_thread_id,
+            "reviewSourceThreadId": review_source_thread_id,
+            "review_thread_id": review_thread_id,
+            "reviewThreadId": review_thread_id,
+            "review_turn_id": review_turn_id,
+            "reviewTurnId": review_turn_id,
+            "current_operation_id": review_operation_id,
+            "currentOperationId": review_operation_id,
+            "review_operation_id": review_operation_id,
+            "reviewOperationId": review_operation_id,
+            "plan_operation_id": None,
+            "planOperationId": None,
+            "execution_operation_id": None,
+            "executionOperationId": None,
+            "phase": phase,
+            "status": status,
+            "lastError": last_error,
+            "createdAt": workflow.get("created_at"),
+            "updatedAt": workflow.get("updated_at"),
+            "completedAt": completed_at,
+            "clientRequestId": workflow.get("client_request_id"),
+            "latestReportHash": workflow.get("latest_report_hash"),
+            "reviewTarget": review_target,
+            "reviewDelivery": workflow.get("review_delivery"),
+            "reviewOperation": review_operation,
+            "reviewTurn": review_turn,
+            "planOperation": None,
+            "executionOperation": None,
+            "planTurn": None,
+            "executionTurn": None,
+            "plans": [],
+            "latestPlan": None,
+            "finalReport": final_report,
+            "threadGoal": self._workflow_goal_status(workflow),
+            "pendingInteractions": pending_interactions,
+            "nextRecommendedAction": _next_review_workflow_action(phase, status),
+            "recommendedPollAfterSeconds": _review_workflow_poll_seconds(phase, status),
+            "pollRecommended": status not in {"completed", "failed", "unknown_after_app_server_exit", "interrupted", "cancelled", "canceled"},
+            "appServerGeneration": self._app_server.process_generation if self._app_server is not None else workflow.get("app_server_generation"),
+            "source": source,
+            "stalenessSeconds": staleness,
+        }
+        if include_events:
+            result["events"] = [_workflow_event_to_tool(row) for row in self.storage.list_workflow_events(workflow_id, limit=20)]
+        return result
+
+    def _review_workflow_final_report(
+        self,
+        workflow: dict[str, Any],
+        *,
+        review_turn: dict[str, Any] | None,
+        message_max_chars: int,
+    ) -> dict[str, Any] | None:
+        workflow_id = str(workflow["workflow_id"])
+        stored: dict[str, Any] | None = None
+        try:
+            loaded = json.loads(str(workflow.get("final_report_json") or "null"))
+            if isinstance(loaded, dict):
+                stored = loaded
+        except json.JSONDecodeError:
+            stored = None
+        final_text = _optional_string((review_turn or {}).get("finalMessage")) or _optional_string((review_turn or {}).get("final_message"))
+        if review_turn is not None and str(review_turn.get("status") or "") == "completed" and final_text:
+            report_hash, report_json = _stored_final_report_json(
+                final_text=final_text,
+                thread_id=review_turn.get("threadId") or workflow.get("review_thread_id") or workflow.get("thread_id"),
+                turn_id=review_turn.get("turnId") or workflow.get("review_turn_id"),
+                source=review_turn.get("source") or "storage",
+                schema_hash=None,
+            )
+            if report_hash != workflow.get("latest_report_hash") or stored is None:
+                self.storage.update_workflow(
+                    workflow_id,
+                    latest_report_hash=report_hash,
+                    final_report_json=report_json,
+                    updated_at=_now_iso(),
+                )
+            try:
+                stored = json.loads(report_json)
+            except json.JSONDecodeError:
+                stored = None
+            if stored is not None:
+                return _report_for_status(stored, message_max_chars=message_max_chars)
+        if stored is not None:
+            return _report_for_status(stored, message_max_chars=message_max_chars)
+        history_report = self._review_history_final_report(workflow, message_max_chars=message_max_chars)
+        if history_report is not None:
+            return history_report
+        return None
+
+    def _review_history_final_report(self, workflow: dict[str, Any], *, message_max_chars: int) -> dict[str, Any] | None:
+        review_thread_id = _optional_string(workflow.get("review_thread_id")) or _optional_string(workflow.get("thread_id"))
+        if not review_thread_id:
+            return None
+        try:
+            self.catalog.refresh()
+            chat = self.catalog.get_chat(review_thread_id)
+        except Exception as exc:  # pragma: no cover - defensive fallback path
+            LOG.debug("review history fallback catalog refresh failed workflow_id=%s error=%s", workflow.get("workflow_id"), exc)
+            return None
+        if chat is None:
+            return None
+        try:
+            summary, source_info = self._load_chat_summary(
+                chat,
+                archived=chat.archived,
+                include_tool_calls=False,
+                include_tool_outputs=False,
+                include_command_outputs=False,
+                include_reasoning=False,
+            )
+        except Exception as exc:  # pragma: no cover - defensive fallback path
+            LOG.debug("review history fallback parse failed workflow_id=%s error=%s", workflow.get("workflow_id"), exc)
+            return None
+        message = _last_message_by_role(summary.messages, "assistant")
+        final_text = _optional_string(message.text if message else None)
+        if not message or not final_text:
+            return None
+        workflow_id = str(workflow["workflow_id"])
+        actual_turn_id = _optional_string(message.turn_id) or _optional_string(workflow.get("review_turn_id"))
+        report_hash, report_json = _stored_final_report_json(
+            final_text=final_text,
+            thread_id=review_thread_id,
+            turn_id=actual_turn_id,
+            source=source_info.get("source") or chat.source or "transcript",
+            schema_hash=None,
+        )
+        now = _now_iso()
+        workflow_updates: dict[str, Any] = {
+            "latest_report_hash": report_hash,
+            "final_report_json": report_json,
+            "updated_at": now,
+        }
+        if actual_turn_id:
+            workflow_updates["review_turn_id"] = actual_turn_id
+        self.storage.update_workflow(workflow_id, **workflow_updates)
+        if report_hash != workflow.get("latest_report_hash"):
+            self.storage.record_workflow_event(
+                workflow_id,
+                event_type="review_report_loaded_from_history",
+                message="Review final report loaded from thread history.",
+                details={"threadId": review_thread_id, "turnId": actual_turn_id, "source": source_info.get("source")},
+                created_at=now,
+            )
+        if actual_turn_id:
+            self.storage.upsert_tracked_turn(
+                {
+                    "turn_id": actual_turn_id,
+                    "thread_id": review_thread_id,
+                    "chat_id": review_thread_id,
+                    "project_id": workflow.get("project_id") or chat.project_id,
+                    "project_path": chat.project_path,
+                    "status": "completed",
+                    "started_at": message.created_at,
+                    "updated_at": message.created_at or now,
+                    "completed_at": message.created_at or now,
+                    "first_message_at": message.created_at,
+                    "final_message": final_text,
+                    "last_error": None,
+                    "clear_last_error": True,
+                    "source": "transcript",
+                }
+            )
+            self.storage.record_tracked_turn_message(
+                {
+                    "event_hash": hashlib.sha256(
+                        f"review-history:{review_thread_id}:{actual_turn_id}:{message.message_id or final_text}".encode("utf-8")
+                    ).hexdigest(),
+                    "turn_id": actual_turn_id,
+                    "thread_id": review_thread_id,
+                    "role": "assistant",
+                    "text": final_text,
+                    "created_at": message.created_at or now,
+                    "sequence": 0,
+                    "event_type": "review_history_final_report",
+                    "payload_json": "{}",
+                }
+            )
+        operation_id = _optional_string(workflow.get("review_operation_id")) or _optional_string(workflow.get("current_operation_id"))
+        operation = self.storage.get_operation(operation_id) if operation_id else None
+        if operation is not None and str(operation.get("status") or "") not in {"failed", "unknown_after_app_server_exit", "interrupted", "cancelled", "canceled"}:
+            self.storage.update_operation(
+                str(operation["operation_id"]),
+                status="completed",
+                phase="completed",
+                thread_id=review_thread_id,
+                turn_id=actual_turn_id or operation.get("turn_id"),
+                latest_report_hash=report_hash,
+                final_report_json=report_json,
+                last_error=None,
+                updated_at=now,
+                completed_at=message.created_at or now,
+                next_attempt_at=None,
+            )
+        try:
+            stored = json.loads(report_json)
+        except json.JSONDecodeError:
+            return None
+        return _report_for_status(stored, message_max_chars=message_max_chars)
 
     def _turn_status_or_none(
         self,
@@ -3537,7 +5449,12 @@ class ToolService:
                 raise invalid_argument("Codex workflow was not found.", workflow_id=workflow_id)
             thread_id = thread_id or _optional_string(workflow.get("thread_id"))
             if explicit_turn_id:
-                turn_id = turn_id or _optional_string(workflow.get("execution_turn_id")) or _optional_string(workflow.get("plan_turn_id"))
+                turn_id = (
+                    turn_id
+                    or _optional_string(workflow.get("review_turn_id"))
+                    or _optional_string(workflow.get("execution_turn_id"))
+                    or _optional_string(workflow.get("plan_turn_id"))
+                )
         status = args.get("status")
         status = str(status).strip() if status not in (None, "") else None
         limit = _bounded_int(args.get("limit", 50), 1, 200)
@@ -3636,12 +5553,14 @@ class ToolService:
             thread_id = thread_id or _optional_string(workflow.get("thread_id"))
             turn_id = (
                 turn_id
+                or _optional_string(workflow.get("review_turn_id"))
                 or _optional_string(workflow.get("execution_turn_id"))
                 or _optional_string(workflow.get("plan_turn_id"))
             )
             operation_id = (
                 operation_id
                 or _optional_string(workflow.get("current_operation_id"))
+                or _optional_string(workflow.get("review_operation_id"))
                 or _optional_string(workflow.get("execution_operation_id"))
                 or _optional_string(workflow.get("plan_operation_id"))
             )
@@ -3675,6 +5594,330 @@ class ToolService:
             "operationId": operation_id,
             "workflowId": workflow_id,
         }
+
+    def _resolve_lifecycle_thread_context(self, *, thread_id: str, project_id: str | None = None) -> dict[str, Any]:
+        resolved_project_id = project_id
+        chat = self.catalog.get_chat(thread_id, project_id)
+        tracked_turn = self.storage.get_latest_tracked_turn_for_thread(thread_id)
+        hook_thread = self.storage.get_hook_thread(thread_id)
+        source = "unknown"
+        project_path: str | None = None
+        archived: bool | None = None
+
+        if chat is not None:
+            source = str(chat.source or "catalog")
+            resolved_project_id = chat.project_id or resolved_project_id
+            project_path = _optional_string(chat.project_path)
+            archived = bool(chat.archived)
+        elif tracked_turn is not None:
+            source = "tracked_turn"
+            resolved_project_id = _optional_string(tracked_turn.get("project_id")) or resolved_project_id
+            project_path = _optional_string(tracked_turn.get("project_path"))
+            archived = None
+        elif hook_thread is not None:
+            source = "hook_history"
+            project_path = _optional_string(hook_thread.get("project_path"))
+            resolved_project_id = resolved_project_id or (project_id_for_path(project_path) if project_path else None)
+            archived = False
+        else:
+            raise thread_not_found(thread_id)
+
+        if project_id and resolved_project_id and project_id != resolved_project_id:
+            raise thread_not_found(thread_id)
+        return {
+            "threadId": thread_id,
+            "projectId": resolved_project_id,
+            "projectPath": project_path,
+            "archived": archived,
+            "source": source,
+            "chat": chat,
+        }
+
+    def _assert_thread_lifecycle_safe(self, thread_id: str) -> None:
+        active_turn = self._active_turn_for_thread(thread_id)
+        if active_turn is not None:
+            raise busy(thread_id, str(active_turn.get("status") or "running"))
+        pending = self._pending_interactions_for_context(thread_id=thread_id, turn_id=None, status="pending", limit=1)
+        if pending:
+            raise busy(thread_id, "pending_interaction")
+
+    def _thread_lifecycle_state(
+        self,
+        *,
+        thread_id: str,
+        project_id: str | None = None,
+        expected_archived: bool | None = None,
+    ) -> dict[str, Any]:
+        chat = self.catalog.get_chat(thread_id, project_id)
+        tracked_turn = self.storage.get_latest_tracked_turn_for_thread(thread_id)
+        pending = self._pending_interactions_for_context(thread_id=thread_id, turn_id=None, status="pending", limit=20)
+        active_turn = self._active_turn_for_thread(thread_id)
+        archived = expected_archived
+        if archived is None and chat is not None:
+            archived = bool(chat.archived)
+        return {
+            "known": bool(chat is not None or tracked_turn is not None or self.storage.get_hook_thread(thread_id) is not None),
+            "threadId": thread_id,
+            "projectId": (chat.project_id if chat is not None else None) or _optional_string((tracked_turn or {}).get("project_id")) or project_id,
+            "title": chat.title if chat is not None else None,
+            "archived": archived,
+            "source": chat.source if chat is not None else ("tracked_turn" if tracked_turn is not None else "hook_history"),
+            "latestTurnId": _optional_string((tracked_turn or {}).get("turn_id")),
+            "latestTurnStatus": _optional_string((tracked_turn or {}).get("status")),
+            "activeTurnId": _optional_string((active_turn or {}).get("turn_id")),
+            "pendingInteractionCount": len(pending),
+        }
+
+    def _create_lifecycle_action(
+        self,
+        *,
+        action_type: str,
+        thread_id: str,
+        project_id: str | None,
+        request: dict[str, Any],
+        status: str,
+    ) -> dict[str, Any]:
+        now = _now_iso()
+        action_id = "tla_" + uuid.uuid4().hex
+        row = {
+            "action_id": action_id,
+            "action_type": action_type,
+            "thread_id": thread_id,
+            "project_id": project_id,
+            "status": status,
+            "created_at": now,
+            "updated_at": now,
+            "request_json": json.dumps(request, ensure_ascii=False, sort_keys=True),
+        }
+        self.storage.create_thread_lifecycle_action(row)
+        return self.storage.get_thread_lifecycle_action(action_id) or row
+
+    def _thread_lifecycle_action_to_tool(
+        self,
+        action: dict[str, Any],
+        *,
+        include_events: bool = False,
+        expected_archived: bool | None = None,
+    ) -> dict[str, Any]:
+        result_payload: dict[str, Any] = {}
+        try:
+            loaded = json.loads(str(action.get("result_json") or "{}"))
+            if isinstance(loaded, dict):
+                result_payload = loaded
+        except json.JSONDecodeError:
+            result_payload = {}
+        action_type = str(action.get("action_type") or "")
+        status = str(action.get("status") or "unknown")
+        thread_id = str(action.get("thread_id") or "")
+        terminal = status in {"completed", "failed", "unknown_after_app_server_exit"}
+        if status == "running":
+            next_action = "poll_thread_compaction"
+            poll_after = 5
+        elif status == "completed" and action_type == "compact":
+            next_action = "read_thread_status"
+            poll_after = 0
+        elif status == "completed":
+            next_action = "read_thread_status"
+            poll_after = 0
+        elif status == "unknown_after_app_server_exit":
+            next_action = "inspect_diagnostics"
+            poll_after = 0
+        else:
+            next_action = "inspect_diagnostics"
+            poll_after = 0
+        response = {
+            "ok": True,
+            "actionId": action.get("action_id"),
+            "actionType": action_type,
+            "threadId": thread_id,
+            "projectId": action.get("project_id"),
+            "status": status,
+            "createdAt": action.get("created_at"),
+            "updatedAt": action.get("updated_at"),
+            "completedAt": action.get("completed_at"),
+            "lastError": action.get("last_error"),
+            "appServerGeneration": action.get("app_server_generation"),
+            "observedEventId": action.get("observed_event_id"),
+            "targetTurnId": action.get("target_turn_id"),
+            "threadState": result_payload.get("threadState")
+            or self._thread_lifecycle_state(thread_id=thread_id, project_id=_optional_string(action.get("project_id")), expected_archived=expected_archived),
+            "nextRecommendedAction": next_action,
+            "recommendedPollAfterSeconds": poll_after,
+            "pollRecommended": not terminal,
+        }
+        if result_payload.get("appServerResult") is not None:
+            response["appServerResult"] = result_payload.get("appServerResult")
+        if include_events:
+            response["events"] = [
+                event_to_tool(row, include_payload=False)
+                for row in self.storage.list_app_server_events(thread_id=thread_id, since=str(action.get("created_at") or ""), limit=50)
+            ]
+        return response
+
+    async def _run_thread_lifecycle_action(
+        self,
+        *,
+        action_type: str,
+        args: dict[str, Any],
+        expected_archived: bool,
+    ) -> dict[str, Any]:
+        thread_id = _required_string(args, "thread_id")
+        project_id = _optional_string(args.get("project_id"))
+        timeout_seconds = _bounded_int(args.get("timeout_seconds", 30), 1, 120)
+        refresh_catalog = bool(args.get("refresh_catalog", True))
+        context = self._resolve_lifecycle_thread_context(thread_id=thread_id, project_id=project_id)
+        self._assert_thread_lifecycle_safe(thread_id)
+        action = self._create_lifecycle_action(
+            action_type=action_type,
+            thread_id=thread_id,
+            project_id=_optional_string(context.get("projectId")),
+            request={
+                "thread_id": thread_id,
+                "project_id": project_id,
+                "timeout_seconds": timeout_seconds,
+                "refresh_catalog": refresh_catalog,
+            },
+            status="starting",
+        )
+        client = await self._app()
+        try:
+            if action_type == "archive":
+                app_result = await client.thread_archive(thread_id, timeout_seconds=timeout_seconds)
+            elif action_type == "unarchive":
+                app_result = await client.thread_unarchive(thread_id, timeout_seconds=timeout_seconds)
+            else:
+                raise invalid_argument("Unsupported lifecycle action.", action_type=action_type)
+        except Exception as exc:
+            now = _now_iso()
+            self.storage.update_thread_lifecycle_action(
+                str(action["action_id"]),
+                status="failed",
+                updated_at=now,
+                completed_at=now,
+                last_error=redact_text(str(exc)),
+                app_server_generation=client.process_generation,
+            )
+            raise
+        if refresh_catalog:
+            with suppress(Exception):
+                self.catalog.refresh()
+        now = _now_iso()
+        thread_state = self._thread_lifecycle_state(
+            thread_id=thread_id,
+            project_id=_optional_string(context.get("projectId")),
+            expected_archived=expected_archived,
+        )
+        self.storage.update_thread_lifecycle_action(
+            str(action["action_id"]),
+            status="completed",
+            updated_at=now,
+            completed_at=now,
+            result_json=json.dumps(
+                {
+                    "appServerResult": app_result,
+                    "threadState": thread_state,
+                },
+                ensure_ascii=False,
+            ),
+            last_error=None,
+            app_server_generation=app_result.get("_processGeneration") or client.process_generation,
+        )
+        updated = self.storage.get_thread_lifecycle_action(str(action["action_id"])) or action
+        return self._thread_lifecycle_action_to_tool(updated, expected_archived=expected_archived)
+
+    async def codex_archive_thread(self, args: dict[str, Any]) -> dict[str, Any]:
+        return await self._run_thread_lifecycle_action(action_type="archive", args=args, expected_archived=True)
+
+    async def codex_unarchive_thread(self, args: dict[str, Any]) -> dict[str, Any]:
+        return await self._run_thread_lifecycle_action(action_type="unarchive", args=args, expected_archived=False)
+
+    async def codex_start_thread_compaction(self, args: dict[str, Any]) -> dict[str, Any]:
+        thread_id = _required_string(args, "thread_id")
+        project_id = _optional_string(args.get("project_id"))
+        timeout_seconds = _bounded_int(args.get("timeout_seconds", 30), 1, 120)
+        context = self._resolve_lifecycle_thread_context(thread_id=thread_id, project_id=project_id)
+        self._assert_thread_lifecycle_safe(thread_id)
+        action = self._create_lifecycle_action(
+            action_type="compact",
+            thread_id=thread_id,
+            project_id=_optional_string(context.get("projectId")),
+            request={"thread_id": thread_id, "project_id": project_id, "timeout_seconds": timeout_seconds},
+            status="starting",
+        )
+        client = await self._app()
+        try:
+            app_result = await client.thread_compact_start(thread_id, timeout_seconds=timeout_seconds)
+        except Exception as exc:
+            now = _now_iso()
+            self.storage.update_thread_lifecycle_action(
+                str(action["action_id"]),
+                status="failed",
+                updated_at=now,
+                completed_at=now,
+                last_error=redact_text(str(exc)),
+                app_server_generation=client.process_generation,
+            )
+            raise
+        now = _now_iso()
+        thread_state = self._thread_lifecycle_state(thread_id=thread_id, project_id=_optional_string(context.get("projectId")))
+        self.storage.update_thread_lifecycle_action(
+            str(action["action_id"]),
+            status="running",
+            updated_at=now,
+            result_json=json.dumps({"appServerResult": app_result, "threadState": thread_state}, ensure_ascii=False),
+            last_error=None,
+            app_server_generation=app_result.get("_processGeneration") or client.process_generation,
+        )
+        updated = self.storage.get_thread_lifecycle_action(str(action["action_id"])) or action
+        return self._thread_lifecycle_action_to_tool(updated)
+
+    def _reconcile_thread_compaction_action(self, action: dict[str, Any]) -> dict[str, Any]:
+        if str(action.get("action_type") or "") != "compact":
+            return action
+        status = str(action.get("status") or "")
+        if status != "running":
+            return action
+        thread_id = str(action.get("thread_id") or "")
+        created_at = str(action.get("created_at") or "")
+        for event in self.storage.list_app_server_events(thread_id=thread_id, since=created_at, limit=500):
+            if event.get("method") != "thread/compacted":
+                continue
+            now = _now_iso()
+            target_turn_id = _optional_string(event.get("turn_id"))
+            self.storage.update_thread_lifecycle_action(
+                str(action["action_id"]),
+                status="completed",
+                updated_at=now,
+                completed_at=now,
+                observed_event_id=event.get("id"),
+                target_turn_id=target_turn_id,
+                last_error=None,
+            )
+            return self.storage.get_thread_lifecycle_action(str(action["action_id"])) or action
+        generation = int(action.get("app_server_generation") or 0)
+        process = getattr(self._app_server, "process", None) if self._app_server is not None else None
+        app_running = self._app_server is not None and process is not None and getattr(process, "returncode", None) is None
+        same_generation = self._app_server is not None and self._app_server.process_generation == generation
+        if generation and (not app_running or not same_generation):
+            now = _now_iso()
+            self.storage.update_thread_lifecycle_action(
+                str(action["action_id"]),
+                status="unknown_after_app_server_exit",
+                updated_at=now,
+                completed_at=now,
+                last_error="Codex app-server exited before thread/compacted was observed.",
+            )
+            return self.storage.get_thread_lifecycle_action(str(action["action_id"])) or action
+        return action
+
+    def codex_get_thread_compaction_status(self, args: dict[str, Any]) -> dict[str, Any]:
+        action_id = _required_string(args, "action_id")
+        include_events = bool(args.get("include_events", False))
+        action = self.storage.get_thread_lifecycle_action(action_id)
+        if action is None:
+            raise invalid_argument("Thread lifecycle action was not found.", action_id=action_id)
+        action = self._reconcile_thread_compaction_action(action)
+        return self._thread_lifecycle_action_to_tool(action, include_events=include_events)
 
     async def codex_restart_app_server(self, args: dict[str, Any]) -> dict[str, Any]:
         start_after_restart = bool(args.get("start_after_restart", True))
@@ -3715,6 +5958,7 @@ class ToolService:
         include_models = bool(args.get("include_models", True))
         include_hooks = bool(args.get("include_hooks", True))
         include_skills = bool(args.get("include_skills", True))
+        include_account = bool(args.get("include_account", True))
         timeout_seconds = _bounded_int(args.get("timeout_seconds", 2), 1, 30)
         cwd = _optional_string(args.get("cwd")) or str(self.config.projects_root)
         if not is_allowed_path(cwd, self.config.allowed_roots):
@@ -3725,6 +5969,7 @@ class ToolService:
                 "includeModels": include_models,
                 "includeHooks": include_hooks,
                 "includeSkills": include_skills,
+                "includeAccount": include_account,
             },
             ensure_ascii=False,
             sort_keys=True,
@@ -3784,6 +6029,9 @@ class ToolService:
                 "hooks": None,
                 "skills": None,
                 "modelProviderCapabilities": None,
+                "accountStatus": None,
+                "accountUsage": None,
+                "rateLimits": None,
             }
             return {
                 "ok": True,
@@ -3890,7 +6138,39 @@ class ToolService:
             lambda: client.model_provider_capabilities_read(timeout_seconds=timeout_seconds),
             compact_provider_capabilities,
         )
+        account_status = None
+        account_usage = None
+        rate_limits = None
+        if include_account:
+            account_status = await run_method(
+                "account/read",
+                lambda: client.account_read(refresh_token=False, timeout_seconds=timeout_seconds),
+                compact_account_status,
+            )
+            if account_status and account_status.get("authenticated"):
+                account_usage = await run_method(
+                    "account/usage/read",
+                    lambda: client.account_usage_read(timeout_seconds=timeout_seconds),
+                    compact_account_usage,
+                )
+                rate_limits = await run_method(
+                    "account/rateLimits/read",
+                    lambda: client.account_rate_limits_read(timeout_seconds=timeout_seconds),
+                    compact_rate_limits,
+                )
+            elif account_status is not None:
+                skip_method("account/usage/read", "unauthenticated")
+                skip_method("account/rateLimits/read", "unauthenticated")
+            else:
+                skip_method("account/usage/read", "account_status_unavailable")
+                skip_method("account/rateLimits/read", "account_status_unavailable")
+        else:
+            skip_method("account/read", "include_account=false")
+            skip_method("account/usage/read", "include_account=false")
+            skip_method("account/rateLimits/read", "include_account=false")
+
         app_status_after = self.codex_get_app_server_status({"include_recent_events": False})
+        initialize = compact_initialize_result(getattr(client, "initialize_result", None))
         runtime_capabilities = {
             "status": "partial" if warnings else "ok",
             "generatedAt": generated_at,
@@ -3898,9 +6178,9 @@ class ToolService:
                 "running": app_status_after.get("running"),
                 "started": app_status_after.get("started"),
                 "processGeneration": app_status_after.get("processGeneration"),
-                "platform": compact_initialize_result(getattr(client, "initialize_result", None)).get("platform"),
-                "userAgent": compact_initialize_result(getattr(client, "initialize_result", None)).get("userAgent"),
-                "initialize": compact_initialize_result(getattr(client, "initialize_result", None)),
+                "platform": initialize.get("platform"),
+                "userAgent": initialize.get("userAgent"),
+                "initialize": initialize,
             },
             "schemaMethods": schema_methods_block(),
             "models": models,
@@ -3909,6 +6189,9 @@ class ToolService:
             "hooks": hooks,
             "skills": skills,
             "modelProviderCapabilities": provider_capabilities,
+            "accountStatus": account_status,
+            "accountUsage": account_usage,
+            "rateLimits": rate_limits,
         }
         result = {
             "ok": True,
@@ -5070,6 +7353,347 @@ def _optional_string(value: Any) -> str | None:
     return text or None
 
 
+def _bounded_optional_text(value: Any, *, field_name: str, max_chars: int) -> str | None:
+    text = _optional_string(value)
+    if text is None:
+        return None
+    if len(text) > max_chars:
+        raise invalid_argument(f"{field_name} is too long.", field=field_name, maxChars=max_chars)
+    return text
+
+
+def _optional_bounded_int(value: Any, min_value: int, max_value: int, *, field_name: str) -> int | None:
+    if value in (None, ""):
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise invalid_argument(f"{field_name} must be an integer.", field=field_name) from exc
+    if parsed < min_value or parsed > max_value:
+        raise invalid_argument(f"{field_name} must be between {min_value} and {max_value}.", field=field_name, min=min_value, max=max_value)
+    return parsed
+
+
+def _safe_digest(value: Any) -> str:
+    return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()[:32]
+
+
+def _image_input_detail(value: Any, *, index: int) -> str:
+    detail = _optional_string(value) or "auto"
+    if detail not in SUPPORTED_IMAGE_INPUT_DETAILS:
+        raise invalid_argument("Unsupported image detail value.", index=index, detail=detail)
+    return detail
+
+
+def _normalize_remote_image_input(
+    item: dict[str, Any],
+    *,
+    detail: str,
+    index: int,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    url = _optional_string(item.get("url"))
+    if not url:
+        raise invalid_argument("image input item requires url.", index=index)
+    if len(url) > IMAGE_INPUT_URL_MAX_CHARS:
+        raise invalid_argument("image url is too long.", index=index, maxChars=IMAGE_INPUT_URL_MAX_CHARS)
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise invalid_argument("image url must use http or https.", index=index, scheme=parsed.scheme or None)
+    normalized = {"type": "image", "url": url, "detail": detail}
+    safe = {
+        "type": "image",
+        "detail": detail,
+        "urlScheme": parsed.scheme,
+        "urlHash": _safe_digest(url),
+    }
+    dedup = {
+        "type": "image",
+        "detail": detail,
+        "urlHash": safe["urlHash"],
+    }
+    return normalized, safe, dedup
+
+
+def _normalize_local_image_input(
+    item: dict[str, Any],
+    *,
+    detail: str,
+    index: int,
+    cwd: str,
+    allowed_roots: list[Path],
+    max_bytes: int,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    raw_path = _optional_string(item.get("path"))
+    if not raw_path:
+        raise invalid_argument("localImage input item requires path.", index=index)
+    candidate = Path(raw_path)
+    if not candidate.is_absolute():
+        if not cwd:
+            raise invalid_argument("Relative localImage path requires a resolved cwd.", index=index)
+        candidate = Path(cwd) / candidate
+    canonical = canonical_existing_path(candidate)
+    path = Path(canonical)
+    if not path.exists():
+        raise invalid_argument("localImage file was not found.", index=index)
+    if not path.is_file():
+        raise invalid_argument("localImage path must point to a file.", index=index)
+    if not is_allowed_path(path, allowed_roots):
+        raise invalid_argument("localImage path is outside the allowlist.", index=index)
+    suffix = path.suffix.casefold()
+    if suffix not in SUPPORTED_IMAGE_INPUT_SUFFIXES:
+        raise invalid_argument("Unsupported localImage file extension.", index=index, extension=suffix)
+    try:
+        stat = path.stat()
+    except OSError as exc:
+        raise invalid_argument("localImage file metadata could not be read.", index=index) from exc
+    size = int(stat.st_size)
+    if size > max_bytes:
+        raise invalid_argument("localImage file is too large.", index=index, maxBytes=max_bytes, actualBytes=size)
+    path_hash = _safe_digest(path_key(path))
+    normalized = {"type": "localImage", "path": canonical, "detail": detail}
+    safe = {
+        "type": "localImage",
+        "detail": detail,
+        "extension": suffix,
+        "sizeBytes": size,
+        "pathHash": path_hash,
+    }
+    dedup = {
+        "type": "localImage",
+        "detail": detail,
+        "extension": suffix,
+        "sizeBytes": size,
+        "mtimeNs": int(stat.st_mtime_ns),
+        "pathHash": path_hash,
+    }
+    return normalized, safe, dedup
+
+
+def _turn_start_input_items(message: str, args: dict[str, Any]) -> list[dict[str, Any]]:
+    input_items = args.get("_input_items")
+    if isinstance(input_items, list):
+        return copy.deepcopy(input_items)
+    return [{"type": "text", "text": message}]
+
+
+def _canonical_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _workflow_goal_hash(objective: str | None, token_budget: int | None) -> str | None:
+    if not objective:
+        return None
+    return hashlib.sha256(
+        _canonical_json(
+            {
+                "objective": objective,
+                "tokenBudget": token_budget,
+            }
+        ).encode("utf-8")
+    ).hexdigest()[:32]
+
+
+def _extract_thread_goal(result: Any) -> dict[str, Any] | None:
+    if not isinstance(result, dict):
+        return None
+    goal = result.get("goal")
+    return goal if isinstance(goal, dict) else None
+
+
+def _thread_goal_hash(goal: dict[str, Any] | None) -> str | None:
+    if not goal:
+        return None
+    objective = _optional_string(goal.get("objective"))
+    try:
+        token_budget = _optional_bounded_int(goal.get("tokenBudget"), 1, 10000000, field_name="tokenBudget")
+    except CodexMcpError:
+        token_budget = None
+    return _workflow_goal_hash(objective, token_budget)
+
+
+def _thread_goal_to_tool(goal: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not goal:
+        return None
+    return {
+        "threadId": goal.get("threadId"),
+        "objective": redact_text(goal.get("objective"), max_chars=1000),
+        "status": goal.get("status"),
+        "tokenBudget": goal.get("tokenBudget"),
+        "tokensUsed": goal.get("tokensUsed"),
+        "timeUsedSeconds": goal.get("timeUsedSeconds"),
+        "createdAt": goal.get("createdAt"),
+        "updatedAt": goal.get("updatedAt"),
+    }
+
+
+def _thread_goal_json(goal: dict[str, Any] | None) -> str | None:
+    compact = _thread_goal_to_tool(goal)
+    return json.dumps(compact, ensure_ascii=False, sort_keys=True) if compact is not None else None
+
+
+def _workflow_goal_from_json(value: Any) -> dict[str, Any] | None:
+    if not value:
+        return None
+    try:
+        loaded = json.loads(str(value))
+    except json.JSONDecodeError:
+        return None
+    return loaded if isinstance(loaded, dict) else None
+
+
+def _is_goal_unsupported_error(exc: Exception) -> bool:
+    text = str(exc).casefold()
+    return any(marker in text for marker in ("method not found", "unknown method", "unsupported", "not supported", "-32601"))
+
+
+def _output_schema_digest(schema: dict[str, Any]) -> str:
+    return hashlib.sha256(_canonical_json(schema).encode("utf-8")).hexdigest()[:32]
+
+
+def _schema_type_includes(schema_type: Any, expected: str) -> bool:
+    if isinstance(schema_type, str):
+        return schema_type == expected
+    if isinstance(schema_type, list):
+        return expected in schema_type
+    return False
+
+
+def _validate_output_schema_node(schema: dict[str, Any], *, path: str) -> None:
+    schema_type = schema.get("type")
+    valid_types = {"object", "array", "string", "number", "integer", "boolean", "null"}
+    if schema_type is not None:
+        if isinstance(schema_type, str):
+            if schema_type not in valid_types:
+                raise invalid_argument("output_schema has an unsupported type.", schemaType=schema_type, path=path)
+        elif isinstance(schema_type, list):
+            if not all(isinstance(item, str) and item in valid_types for item in schema_type):
+                raise invalid_argument("output_schema has an unsupported type list.", schemaType=schema_type, path=path)
+        else:
+            raise invalid_argument("output_schema.type must be a string or list of strings.", path=path)
+    properties = schema.get("properties")
+    if properties is not None and not isinstance(properties, dict):
+        raise invalid_argument("output_schema.properties must be an object.", path=path)
+    if "required" in schema and not (
+        isinstance(schema["required"], list) and all(isinstance(item, str) and item for item in schema["required"])
+    ):
+        raise invalid_argument("output_schema.required must be a list of strings.", path=path)
+    for key in ("$defs", "definitions"):
+        if key in schema and not isinstance(schema[key], dict):
+            raise invalid_argument(f"output_schema.{key} must be an object.", path=path)
+    if (_schema_type_includes(schema_type, "object") or properties is not None) and schema.get("additionalProperties") is not False:
+        raise invalid_argument(
+            "output_schema object schemas must set additionalProperties=false.",
+            path=path,
+        )
+    if isinstance(properties, dict):
+        for name, child in properties.items():
+            if isinstance(child, dict):
+                _validate_output_schema_node(child, path=f"{path}.properties.{name}")
+    items = schema.get("items")
+    if isinstance(items, dict):
+        _validate_output_schema_node(items, path=f"{path}.items")
+    elif isinstance(items, list):
+        for index, child in enumerate(items):
+            if isinstance(child, dict):
+                _validate_output_schema_node(child, path=f"{path}.items[{index}]")
+    for key in ("$defs", "definitions"):
+        definitions = schema.get(key)
+        if isinstance(definitions, dict):
+            for name, child in definitions.items():
+                if isinstance(child, dict):
+                    _validate_output_schema_node(child, path=f"{path}.{key}.{name}")
+    for key in ("allOf", "anyOf", "oneOf"):
+        variants = schema.get(key)
+        if isinstance(variants, list):
+            for index, child in enumerate(variants):
+                if isinstance(child, dict):
+                    _validate_output_schema_node(child, path=f"{path}.{key}[{index}]")
+
+
+def _validate_output_schema(value: Any) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    if value in (None, ""):
+        return None, None
+    if not isinstance(value, dict):
+        raise invalid_argument("output_schema must be a JSON object.")
+    try:
+        canonical = _canonical_json(value)
+        schema = json.loads(canonical)
+    except (TypeError, ValueError) as exc:
+        raise invalid_argument("output_schema must be JSON serializable.") from exc
+    if len(canonical) > OUTPUT_SCHEMA_MAX_CHARS:
+        raise invalid_argument("output_schema is too large.", maxChars=OUTPUT_SCHEMA_MAX_CHARS, actualChars=len(canonical))
+    if not schema:
+        raise invalid_argument("output_schema must not be empty.")
+    _validate_output_schema_node(schema, path="$")
+    digest = _output_schema_digest(schema)
+    return schema, {
+        "provided": True,
+        "applied": True,
+        "source": "request",
+        "parseStatus": "pending",
+        "schemaHash": digest,
+        "schemaChars": len(canonical),
+    }
+
+
+def _extract_structured_report(text: str | None) -> tuple[dict[str, Any] | None, str]:
+    raw = _optional_string(text)
+    if not raw:
+        return None, "empty"
+    candidates = [raw]
+    for match in re.finditer(r"```(?:json|JSON)?\s*(.*?)```", raw, flags=re.DOTALL):
+        candidate = match.group(1).strip()
+        if candidate:
+            candidates.append(candidate)
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            return parsed, "valid_json"
+    return None, "plain_text"
+
+
+def _stored_final_report_json(
+    *,
+    final_text: str,
+    thread_id: Any,
+    turn_id: Any,
+    source: Any,
+    schema_hash: str | None,
+) -> tuple[str, str]:
+    structured, parse_status = _extract_structured_report(final_text)
+    report_hash_basis = {"text": final_text, "structured": structured, "schemaHash": schema_hash}
+    full_report = {
+        "text": final_text,
+        "summary": final_text,
+        "threadId": thread_id,
+        "turnId": turn_id,
+        "source": source or "storage",
+        "readFullVia": "codex_get_chat",
+        "structured": structured,
+        "structuredStatus": "parsed" if structured is not None else "not_available",
+        "structuredParseStatus": parse_status,
+        "schemaHash": schema_hash,
+    }
+    return prompt_hash(_canonical_json(report_hash_basis)), json.dumps(full_report, ensure_ascii=False)
+
+
+def _report_for_status(stored: dict[str, Any], *, message_max_chars: int) -> dict[str, Any]:
+    text = _optional_string(stored.get("text")) or ""
+    truncated, budget = _truncate_text(text, message_max_chars)
+    report = dict(stored)
+    report["text"] = truncated
+    report["summary"] = truncated
+    report["truncated"] = bool(budget.get("truncated"))
+    report["originalChars"] = budget.get("original_chars")
+    report["returnedChars"] = budget.get("returned_chars")
+    report.setdefault("structuredStatus", "parsed" if isinstance(report.get("structured"), dict) else "not_available")
+    report.setdefault("readFullVia", "codex_get_chat")
+    return report
+
+
 def _diagnostic_log_path() -> Path:
     configured = os.environ.get("CODEX_CONTROL_PLANE_MCP_LOG") or os.environ.get("OPENCLAW_CODEX_MCP_LOG")
     if configured:
@@ -5151,6 +7775,13 @@ def _tracked_turn_last_error(row: dict[str, Any]) -> Any:
     if row.get("status") == "completed" and row.get("last_error") == WAITING_FOR_OPENCLAW_ERROR:
         return None
     return row.get("last_error")
+
+
+def _turn_status_with_final_message(status: Any, final_message: str | None) -> str:
+    value = str(status or "unknown").strip().lower()
+    if value == "ready" and final_message and final_message.strip():
+        return "completed"
+    return value or "unknown"
 
 
 def _tracked_turn_summary_to_tool(row: dict[str, Any]) -> dict[str, Any]:
@@ -5322,16 +7953,20 @@ def _tool_surface_hash() -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-def _operation_request_payload(args: dict[str, Any], *, operation_type: str, message: str) -> dict[str, Any]:
+def _operation_request_payload(args: dict[str, Any], *, operation_type: str, message: str | None) -> dict[str, Any]:
     keys = {
         "project_id",
         "chat_id",
         "thread_id",
+        "source_thread_id",
         "expected_turn_id",
         "workflow_id",
         "title",
         "cwd",
         "model",
+        "fork_config",
+        "ephemeral",
+        "output_schema_hash",
         "collaboration_mode",
         "approval_policy",
         "sandbox",
@@ -5339,10 +7974,9 @@ def _operation_request_payload(args: dict[str, Any], *, operation_type: str, mes
         "timeout_seconds",
         "first_message_max_chars",
     }
-    payload = {
-        "operation_type": operation_type,
-        "message": message,
-    }
+    payload = {"operation_type": operation_type}
+    if message not in (None, ""):
+        payload["message"] = message
     for key in sorted(keys):
         value = args.get(key)
         if value not in (None, ""):
@@ -5419,11 +8053,26 @@ def _operation_row_to_tool(row: dict[str, Any]) -> dict[str, Any]:
         "startedAt": row.get("started_at"),
         "completed_at": row.get("completed_at"),
         "completedAt": row.get("completed_at"),
+        "latestReportHash": row.get("latest_report_hash"),
         "last_error": row.get("last_error"),
         "lastError": row.get("last_error"),
         "appServerGeneration": row.get("app_server_generation"),
         "request": public_request,
     }
+    output_schema_state = request_payload.get("_output_schema_state") if isinstance(request_payload.get("_output_schema_state"), dict) else None
+    if output_schema_state is None and request_payload.get("output_schema_hash"):
+        output_schema_state = {
+            "provided": True,
+            "applied": True,
+            "source": "request",
+            "parseStatus": "pending",
+            "schemaHash": request_payload.get("output_schema_hash"),
+        }
+    if output_schema_state is not None:
+        result["outputSchemaState"] = dict(output_schema_state)
+    input_item_state = request_payload.get("_input_item_state")
+    if isinstance(input_item_state, dict):
+        result["inputItemState"] = dict(input_item_state)
     original_operation_type = request_payload.get("original_operation_type")
     if original_operation_type:
         result["originalOperationType"] = original_operation_type
@@ -5455,6 +8104,30 @@ def _operation_row_to_tool(row: dict[str, Any]) -> dict[str, Any]:
             "targetTurnId": result_steer_state.get("targetTurnId") or row.get("turn_id") or request_payload.get("expected_turn_id"),
             "clientUserMessageId": client_user_message_id,
         }
+    if row.get("operation_type") == "fork_thread":
+        result_fork_state = result_payload.get("forkState") if isinstance(result_payload.get("forkState"), dict) else {}
+        result["forkState"] = {
+            "accepted": bool(result_fork_state.get("accepted")) or bool(row.get("thread_id")),
+            "sourceThreadId": result_fork_state.get("sourceThreadId") or request_payload.get("source_thread_id"),
+            "forkedThreadId": result_fork_state.get("forkedThreadId") or row.get("thread_id"),
+            "hasInitialMessage": bool(result_fork_state.get("hasInitialMessage")) or bool(_optional_string(request_payload.get("message"))),
+            "cwd": result_fork_state.get("cwd") or row.get("cwd") or request_payload.get("cwd"),
+            "model": result_fork_state.get("model") or request_payload.get("model"),
+            "ephemeral": bool(result_fork_state.get("ephemeral")) or bool(request_payload.get("ephemeral", False)),
+            "turnId": result_fork_state.get("turnId") or row.get("turn_id"),
+        }
+    if row.get("operation_type") == "review_start":
+        result_review_state = result_payload.get("reviewState") if isinstance(result_payload.get("reviewState"), dict) else {}
+        target = result_review_state.get("target") if isinstance(result_review_state.get("target"), dict) else request_payload.get("_review_target")
+        result["reviewState"] = {
+            "accepted": bool(result_review_state.get("accepted")) or bool(row.get("turn_id")),
+            "sourceThreadId": result_review_state.get("sourceThreadId") or request_payload.get("_review_source_thread_id") or request_payload.get("thread_id"),
+            "reviewThreadId": row.get("thread_id") or result_review_state.get("reviewThreadId"),
+            "reviewTurnId": row.get("turn_id") or result_review_state.get("reviewTurnId"),
+            "target": target if isinstance(target, dict) else None,
+            "delivery": result_review_state.get("delivery") or request_payload.get("_review_delivery") or request_payload.get("delivery"),
+            "startAttempted": bool(request_payload.get("_review_start_attempted")),
+        }
     return result
 
 
@@ -5469,13 +8142,15 @@ def _operation_next_action(payload: dict[str, Any]) -> str:
     status = str(payload.get("status") or "")
     if status == "queued":
         return "wait_for_background_worker"
-    if status in {"starting_app_server", "starting_thread", "starting_turn"}:
+    if status in {"starting_app_server", "starting_thread", "starting_review", "starting_turn"}:
         return "poll_operation_status"
     if status in {"waiting_for_approval", "waiting_for_user_input"}:
         return "answer_pending_interaction"
     if status == "running":
         return "poll_turn_status"
     if status == "completed":
+        if payload.get("operationType") == "fork_thread" and not payload.get("turnId"):
+            return "read_forked_thread"
         return "read_final_report"
     if status == "orphaned" and (payload.get("turnId") or payload.get("threadId")):
         return "poll_history"
@@ -5530,6 +8205,60 @@ def _extract_turn_id(result: dict[str, Any]) -> str | None:
 
 def _extract_thread_id(result: dict[str, Any]) -> str | None:
     return result.get("threadId") or result.get("id") or (result.get("thread") or {}).get("id")
+
+
+def _extract_review_thread_id(result: dict[str, Any]) -> str | None:
+    return result.get("reviewThreadId") or result.get("review_thread_id") or _extract_thread_id(result)
+
+
+def _review_target_from_args(args: dict[str, Any]) -> dict[str, Any]:
+    target_type = _required_string(args, "target_type")
+    if target_type == "uncommitted_changes":
+        return {"type": "uncommittedChanges"}
+    if target_type == "base_branch":
+        return {"type": "baseBranch", "branch": _required_string(args, "base_branch")}
+    if target_type == "commit":
+        target = {"type": "commit", "sha": _required_string(args, "commit_sha")}
+        title = _optional_string(args.get("commit_title"))
+        if title:
+            target["title"] = title
+        return target
+    if target_type == "custom":
+        return {"type": "custom", "instructions": _required_string(args, "instructions")}
+    raise invalid_argument("Unsupported review target_type.", target_type=target_type)
+
+
+def _review_turn_initial_status(turn: dict[str, Any]) -> str:
+    status = str((turn or {}).get("status") or "").strip().lower()
+    if status in {"completed", "complete", "done"}:
+        return "completed"
+    if status in {"failed", "error"}:
+        return "failed"
+    if status in {"interrupted", "cancelled", "canceled", "aborted"}:
+        return "interrupted" if status == "interrupted" else status
+    return "running"
+
+
+def _review_target_label(target: dict[str, Any]) -> str:
+    target_type = str(target.get("type") or "review")
+    if target_type == "baseBranch":
+        return f"Code review against base branch {target.get('branch') or ''}".strip()
+    if target_type == "commit":
+        title = _optional_string(target.get("title"))
+        return f"Code review for commit {target.get('sha') or ''}{': ' + title if title else ''}".strip()
+    if target_type == "custom":
+        return "Code review with custom instructions"
+    return "Code review for uncommitted changes"
+
+
+def _operation_review_start_attempted(operation: dict[str, Any]) -> bool:
+    payload = _operation_request_from_row(operation)
+    return bool(payload.get("_review_start_attempted"))
+
+
+def _review_start_error_is_ambiguous(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return any(marker in text for marker in ("timeout", "timed out", "stdout closed", "connection", "cancelled", "canceled"))
 
 
 def _redacted_preview(value: str, limit: int = 120) -> str:
@@ -5725,6 +8454,55 @@ def _derive_workflow_phase(
     return "planning", plan_status if plan_status not in {"unknown", ""} else "planning", None
 
 
+def _derive_review_workflow_phase(
+    workflow: dict[str, Any],
+    *,
+    review_turn: dict[str, Any] | None,
+    review_operation: dict[str, Any] | None,
+    pending_interactions: list[dict[str, Any]],
+) -> tuple[str, str, str | None]:
+    if pending_interactions:
+        if any(item.get("kind") == "user_input" for item in pending_interactions):
+            return "waiting_for_user_input", "waiting_for_user_input", workflow.get("last_error")
+        return "waiting_for_approval", "waiting_for_approval", workflow.get("last_error")
+
+    if _optional_string(workflow.get("final_report_json")):
+        return "completed", "completed", None
+
+    if review_turn is not None:
+        turn_status = str(review_turn.get("status") or "unknown")
+        if turn_status == "completed":
+            return "completed", "completed", None
+        if turn_status in {"failed", "aborted", "cancelled", "canceled", "interrupted"}:
+            status = "failed" if turn_status == "failed" else turn_status
+            return "failed", status, review_turn.get("lastError") or review_turn.get("last_error") or workflow.get("last_error")
+        if turn_status == "unknown_after_app_server_exit":
+            return "orphaned", "unknown_after_app_server_exit", review_turn.get("lastError") or review_turn.get("last_error") or workflow.get("last_error")
+        if turn_status and turn_status != "unknown":
+            return "reviewing", turn_status if turn_status not in {"running", "first_message_received"} else "reviewing", None
+
+    if review_operation is not None:
+        operation_status = str(review_operation.get("status") or "unknown")
+        if operation_status == "completed":
+            return "completed", "completed", None
+        if operation_status == "unknown_after_app_server_exit":
+            return "orphaned", "unknown_after_app_server_exit", review_operation.get("lastError") or workflow.get("last_error")
+        if operation_status in {"failed", "aborted", "cancelled", "canceled", "interrupted", "orphaned"}:
+            return "failed", operation_status, review_operation.get("lastError") or workflow.get("last_error")
+        if operation_status == "starting_thread":
+            return "starting_thread", "starting_thread", None
+        if operation_status == "starting_review":
+            return "starting_review", "starting_review", None
+        if operation_status in {"queued", "starting_app_server"}:
+            return "queued", operation_status, None
+        if operation_status in {"running", "first_message_received"}:
+            return "reviewing", "reviewing", None
+
+    phase = str(workflow.get("phase") or "queued")
+    status = str(workflow.get("status") or phase)
+    return phase, status, workflow.get("last_error")
+
+
 def _next_workflow_action(phase: str) -> str:
     if phase == "plan_ready":
         return "execute_plan"
@@ -5741,6 +8519,16 @@ def _next_workflow_action(phase: str) -> str:
     return "wait_plan"
 
 
+def _next_review_workflow_action(phase: str, status: str) -> str:
+    if phase in {"waiting_for_approval", "waiting_for_user_input"}:
+        return "answer_pending_interaction"
+    if phase == "completed" or status == "completed":
+        return "read_review_report"
+    if phase in {"failed", "orphaned"} or status in {"failed", "unknown_after_app_server_exit", "orphaned", "interrupted", "cancelled", "canceled"}:
+        return "inspect_diagnostics"
+    return "wait_review"
+
+
 def _workflow_poll_seconds(phase: str) -> int:
     if phase in {"waiting_for_approval", "waiting_for_user_input"}:
         return 15
@@ -5751,6 +8539,24 @@ def _workflow_poll_seconds(phase: str) -> int:
     if phase in {"plan_ready", "completed", "failed", "orphaned_after_app_server_exit"}:
         return 0
     return 15
+
+
+def _review_workflow_poll_seconds(phase: str, status: str) -> int:
+    if phase in {"waiting_for_approval", "waiting_for_user_input"}:
+        return 15
+    if phase in {"completed", "failed", "orphaned"} or status in {"completed", "failed", "unknown_after_app_server_exit"}:
+        return 0
+    if phase in {"queued", "starting_thread", "starting_review"}:
+        return 5
+    return 15
+
+
+def _workflow_review_target(workflow: dict[str, Any]) -> dict[str, Any] | None:
+    try:
+        loaded = json.loads(str(workflow.get("review_target_json") or "null"))
+    except json.JSONDecodeError:
+        return None
+    return loaded if isinstance(loaded, dict) else None
 
 
 def _workflow_event_to_tool(row: dict[str, Any]) -> dict[str, Any]:

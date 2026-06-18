@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on Keep a Changelog and this project uses semantic
 versioning after the public `0.1.0` release.
 
+## [0.1.3] - 2026-06-18
+
+### Added
+
+- Add a richer app-server progress journal for assistant deltas, plan deltas, reasoning summaries, token usage, model reroutes, warnings, and safe diff statistics.
+- Add runtime capabilities for models, permission profiles, sandbox readiness, hooks, skills, provider features, redacted account status, usage bands, and rate-limit state.
+- Add durable `fork_thread`, `steer_turn`, structured final reports through `output_schema`, image inputs, thread lifecycle tools, workflow goal sync, and code review workflows.
+- Restore and update the thin-wrapper comparison guide from PR #9.
+
+### Changed
+
+- Keep public defaults safe with `read-only` sandbox and `on-request` approval unless a caller or local config explicitly overrides them.
+- Expand README and API documentation to cover the completed roadmap features and the privacy contract for account and rate-limit data.
+- Align package, runtime server version, and MCP Registry metadata at `0.1.3`.
+
 ## [0.1.2] - 2026-06-17
 
 ### Added

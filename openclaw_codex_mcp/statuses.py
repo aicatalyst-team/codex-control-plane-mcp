@@ -5,6 +5,7 @@ OPERATION_STARTABLE_STATUSES = {
     "queued",
     "starting_app_server",
     "starting_thread",
+    "starting_review",
     "starting_turn",
 }
 

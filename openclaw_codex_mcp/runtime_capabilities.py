@@ -276,6 +276,69 @@ def compact_provider_capabilities(value: Any) -> dict[str, Any]:
     }
 
 
+def compact_account_status(value: Any) -> dict[str, Any]:
+    data = _dict(value)
+    account = _dict(data.get("account"))
+    requires_auth = bool(data.get("requiresOpenaiAuth"))
+    account_type = _safe_text(account.get("type"), 80)
+    plan_type = _safe_text(account.get("planType"), 80)
+    email = account.get("email")
+    return {
+        "authenticated": bool(account) and not requires_auth,
+        "requiresOpenaiAuth": requires_auth,
+        "accountType": account_type,
+        "planType": plan_type,
+        "emailPresent": isinstance(email, str) and bool(email.strip()),
+        "identityRedacted": True,
+    }
+
+
+def compact_account_usage(value: Any) -> dict[str, Any]:
+    data = _dict(value)
+    summary = _dict(data.get("summary"))
+    daily_buckets = data.get("dailyUsageBuckets") if isinstance(data.get("dailyUsageBuckets"), list) else []
+    return {
+        "available": bool(summary or daily_buckets),
+        "dailyBucketCount": len(daily_buckets),
+        "hasDailyBuckets": bool(daily_buckets),
+        "exactValuesRedacted": True,
+        "summary": {
+            "lifetimeUsageBand": _number_band(summary.get("lifetimeTokens"), [(0, "zero"), (1_000_000, "lt_1m"), (10_000_000, "1m_10m"), (100_000_000, "10m_100m")], "100m_plus"),
+            "peakDailyUsageBand": _number_band(summary.get("peakDailyTokens"), [(0, "zero"), (100_000, "lt_100k"), (1_000_000, "100k_1m"), (10_000_000, "1m_10m")], "10m_plus"),
+            "currentStreakDaysBand": _number_band(summary.get("currentStreakDays"), [(0, "zero"), (8, "1_7"), (31, "8_30"), (181, "31_180")], "181_plus"),
+            "longestStreakDaysBand": _number_band(summary.get("longestStreakDays"), [(0, "zero"), (8, "1_7"), (31, "8_30"), (181, "31_180")], "181_plus"),
+            "longestRunningTurnBand": _number_band(summary.get("longestRunningTurnSec"), [(60, "lt_1m"), (600, "1m_10m"), (3600, "10m_1h")], "1h_plus"),
+        },
+    }
+
+
+def compact_rate_limits(value: Any) -> dict[str, Any]:
+    data = _dict(value)
+    primary = _compact_rate_limit_snapshot(data.get("rateLimits"))
+    raw_buckets = data.get("rateLimitsByLimitId")
+    buckets: list[dict[str, Any]] = []
+    if isinstance(raw_buckets, dict):
+        for key in sorted(raw_buckets):
+            compact = _compact_rate_limit_snapshot(raw_buckets.get(key), bucket_key=str(key))
+            if compact:
+                buckets.append(compact)
+    elif primary:
+        buckets.append(primary)
+    reached_type = primary.get("rateLimitReachedType") if primary else None
+    return {
+        "available": bool(primary or buckets),
+        "bucketCount": len(buckets),
+        "bucketsTruncated": len(buckets) > 10,
+        "rateLimitReached": bool(reached_type and reached_type != "none")
+        or any(bool(bucket.get("rateLimitReachedType") and bucket.get("rateLimitReachedType") != "none") for bucket in buckets),
+        "rateLimitReachedType": reached_type,
+        "planType": primary.get("planType") if primary else None,
+        "credits": primary.get("credits") if primary else None,
+        "primary": primary,
+        "buckets": buckets[:10],
+    }
+
+
 def compact_sandbox_readiness(value: Any) -> dict[str, Any]:
     data = _dict(value)
     return {
@@ -292,10 +355,20 @@ def runtime_health_subset(snapshot: dict[str, Any] | None, *, cache_age_seconds:
             "defaultModel": None,
             "sandboxReadiness": None,
             "providerCapabilities": None,
+            "accountAuthenticated": None,
+            "accountType": None,
+            "planType": None,
+            "rateLimitReached": None,
+            "creditsAvailable": None,
+            "usageAvailable": None,
             "warningsCount": 0,
         }
     capabilities = _dict(snapshot.get("runtimeCapabilities"))
     models = _dict(capabilities.get("models"))
+    account_status = _dict(capabilities.get("accountStatus"))
+    account_usage = _dict(capabilities.get("accountUsage"))
+    rate_limits = _dict(capabilities.get("rateLimits"))
+    credits = _dict(rate_limits.get("credits"))
     return {
         "status": capabilities.get("status") or "unknown",
         "cacheAgeSeconds": cache_age_seconds,
@@ -303,6 +376,12 @@ def runtime_health_subset(snapshot: dict[str, Any] | None, *, cache_age_seconds:
         "defaultModel": models.get("defaultModel"),
         "sandboxReadiness": _dict(capabilities.get("sandboxReadiness")).get("status"),
         "providerCapabilities": capabilities.get("modelProviderCapabilities"),
+        "accountAuthenticated": account_status.get("authenticated"),
+        "accountType": account_status.get("accountType"),
+        "planType": account_status.get("planType") or rate_limits.get("planType"),
+        "rateLimitReached": rate_limits.get("rateLimitReached"),
+        "creditsAvailable": credits.get("hasCredits"),
+        "usageAvailable": account_usage.get("available"),
         "warningsCount": len(snapshot.get("warnings") if isinstance(snapshot.get("warnings"), list) else []),
     }
 
@@ -362,6 +441,124 @@ def _optional_bool(value: Any) -> bool | None:
     if isinstance(value, bool):
         return value
     return None
+
+
+def _compact_rate_limit_snapshot(value: Any, *, bucket_key: str | None = None) -> dict[str, Any]:
+    data = _dict(value)
+    if not data:
+        return {}
+    limit_id = _safe_text(data.get("limitId") or bucket_key, 120)
+    limit_name = _safe_text(data.get("limitName"), 120)
+    public_key = limit_id if limit_id in {"codex"} else None
+    identity = limit_id or limit_name or bucket_key or ""
+    return {
+        "knownBucket": public_key,
+        "bucketHash": hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16] if identity else None,
+        "planType": _safe_text(data.get("planType"), 80),
+        "rateLimitReachedType": _safe_text(data.get("rateLimitReachedType"), 80),
+        "credits": _compact_credits(data.get("credits")),
+        "primaryWindow": _compact_window(data.get("primary")),
+        "secondaryWindow": _compact_window(data.get("secondary")),
+        "individualLimit": _compact_individual_limit(data.get("individualLimit")),
+        "identityRedacted": True,
+    }
+
+
+def _compact_credits(value: Any) -> dict[str, Any] | None:
+    data = _dict(value)
+    if not data:
+        return None
+    return {
+        "hasCredits": _optional_bool(data.get("hasCredits")),
+        "unlimited": _optional_bool(data.get("unlimited")),
+        "balanceRedacted": "balance" in data,
+    }
+
+
+def _compact_window(value: Any) -> dict[str, Any] | None:
+    data = _dict(value)
+    if not data:
+        return None
+    used_percent = _safe_float(data.get("usedPercent"))
+    return {
+        "usedPercent": used_percent,
+        "usedBand": _percent_band(used_percent),
+        "resetInMinutes": _reset_in_minutes(data.get("resetsAt")),
+        "windowDurationMins": _safe_int(data.get("windowDurationMins")),
+    }
+
+
+def _compact_individual_limit(value: Any) -> dict[str, Any] | None:
+    data = _dict(value)
+    if not data:
+        return None
+    return {
+        "present": True,
+        "remainingPercent": _safe_float(data.get("remainingPercent")),
+        "resetInMinutes": _reset_in_minutes(data.get("resetsAt")),
+        "valuesRedacted": bool({"limit", "used"} & set(data.keys())),
+    }
+
+
+def _number_band(value: Any, thresholds: list[tuple[int, str]], fallback: str) -> str | None:
+    number = _safe_float(value)
+    if number is None:
+        return None
+    if number < 0:
+        return "unknown"
+    for upper_bound, label in thresholds:
+        if number < upper_bound or (upper_bound == 0 and number == 0):
+            return label
+    return fallback
+
+
+def _percent_band(value: float | None) -> str | None:
+    if value is None:
+        return None
+    if value >= 100:
+        return "limit_reached"
+    if value >= 90:
+        return "near_limit"
+    if value >= 70:
+        return "high"
+    if value >= 40:
+        return "medium"
+    return "low"
+
+
+def _reset_in_minutes(value: Any) -> int | None:
+    if value in (None, ""):
+        return None
+    if isinstance(value, (int, float)):
+        if value <= 0:
+            return 0
+        timestamp_seconds = float(value) / 1000 if value > 10_000_000_000 else float(value)
+        return max(0, int((datetime.fromtimestamp(timestamp_seconds, tz=timezone.utc) - datetime.now(timezone.utc)).total_seconds() // 60))
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return max(0, int((parsed.astimezone(timezone.utc) - datetime.now(timezone.utc)).total_seconds() // 60))
+
+
+def _safe_float(value: Any) -> float | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_int(value: Any) -> int | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _count(counter: dict[str, int], key: str) -> None:

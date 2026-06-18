@@ -210,6 +210,12 @@ CREATE TABLE IF NOT EXISTS codex_workflows(
   current_operation_id TEXT,
   plan_operation_id TEXT,
   execution_operation_id TEXT,
+  review_operation_id TEXT,
+  review_source_thread_id TEXT,
+  review_thread_id TEXT,
+  review_turn_id TEXT,
+  review_target_json TEXT,
+  review_delivery TEXT,
   project_id TEXT NOT NULL,
   thread_id TEXT NOT NULL,
   plan_turn_id TEXT NOT NULL,
@@ -218,6 +224,16 @@ CREATE TABLE IF NOT EXISTS codex_workflows(
   latest_plan_hash TEXT,
   latest_report_hash TEXT,
   final_report_json TEXT,
+  goal_objective TEXT,
+  goal_token_budget INTEGER,
+  goal_completion_action TEXT NOT NULL DEFAULT 'clear',
+  goal_completion_objective TEXT,
+  goal_sync_state TEXT NOT NULL DEFAULT 'not_configured',
+  goal_app_server_json TEXT,
+  goal_last_error TEXT,
+  goal_last_synced_at TEXT,
+  goal_cleared_at TEXT,
+  goal_managed_hash TEXT,
   phase TEXT NOT NULL,
   status TEXT NOT NULL,
   last_error TEXT,
@@ -268,6 +284,8 @@ CREATE TABLE IF NOT EXISTS codex_operations(
   started_at TEXT,
   completed_at TEXT,
   app_server_generation INTEGER,
+  latest_report_hash TEXT,
+  final_report_json TEXT,
   lease_owner TEXT,
   lease_expires_at TEXT,
   next_attempt_at TEXT,
@@ -283,6 +301,29 @@ ON codex_operations(status, updated_at);
 
 CREATE INDEX IF NOT EXISTS idx_codex_operations_turn
 ON codex_operations(turn_id);
+
+CREATE TABLE IF NOT EXISTS codex_thread_lifecycle_actions(
+  action_id TEXT PRIMARY KEY,
+  action_type TEXT NOT NULL,
+  thread_id TEXT NOT NULL,
+  project_id TEXT,
+  status TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  completed_at TEXT,
+  request_json TEXT NOT NULL,
+  result_json TEXT,
+  last_error TEXT,
+  app_server_generation INTEGER,
+  observed_event_id INTEGER,
+  target_turn_id TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_codex_thread_lifecycle_thread
+ON codex_thread_lifecycle_actions(thread_id, created_at);
+
+CREATE INDEX IF NOT EXISTS idx_codex_thread_lifecycle_status
+ON codex_thread_lifecycle_actions(status, updated_at);
 
 CREATE TABLE IF NOT EXISTS codex_prompt_submissions(
   prompt_submission_id TEXT PRIMARY KEY,
@@ -890,14 +931,38 @@ class McpStorage:
         self._add_column_if_missing("codex_workflows", "current_operation_id", "TEXT")
         self._add_column_if_missing("codex_workflows", "plan_operation_id", "TEXT")
         self._add_column_if_missing("codex_workflows", "execution_operation_id", "TEXT")
+        self._add_column_if_missing("codex_workflows", "review_operation_id", "TEXT")
+        self._add_column_if_missing("codex_workflows", "review_source_thread_id", "TEXT")
+        self._add_column_if_missing("codex_workflows", "review_thread_id", "TEXT")
+        self._add_column_if_missing("codex_workflows", "review_turn_id", "TEXT")
+        self._add_column_if_missing("codex_workflows", "review_target_json", "TEXT")
+        self._add_column_if_missing("codex_workflows", "review_delivery", "TEXT")
         self._add_column_if_missing("codex_workflows", "latest_plan_item_id", "TEXT")
         self._add_column_if_missing("codex_workflows", "latest_plan_hash", "TEXT")
         self._add_column_if_missing("codex_workflows", "latest_report_hash", "TEXT")
         self._add_column_if_missing("codex_workflows", "final_report_json", "TEXT")
+        self._add_column_if_missing("codex_workflows", "goal_objective", "TEXT")
+        self._add_column_if_missing("codex_workflows", "goal_token_budget", "INTEGER")
+        self._add_column_if_missing("codex_workflows", "goal_completion_action", "TEXT NOT NULL DEFAULT 'clear'")
+        self._add_column_if_missing("codex_workflows", "goal_completion_objective", "TEXT")
+        self._add_column_if_missing("codex_workflows", "goal_sync_state", "TEXT NOT NULL DEFAULT 'not_configured'")
+        self._add_column_if_missing("codex_workflows", "goal_app_server_json", "TEXT")
+        self._add_column_if_missing("codex_workflows", "goal_last_error", "TEXT")
+        self._add_column_if_missing("codex_workflows", "goal_last_synced_at", "TEXT")
+        self._add_column_if_missing("codex_workflows", "goal_cleared_at", "TEXT")
+        self._add_column_if_missing("codex_workflows", "goal_managed_hash", "TEXT")
         self.connection.execute(
             "UPDATE codex_workflows SET workflow_kind = 'plan_then_execute' WHERE workflow_kind IS NULL OR workflow_kind = ''"
         )
+        self.connection.execute(
+            "UPDATE codex_workflows SET goal_completion_action = 'clear' WHERE goal_completion_action IS NULL OR goal_completion_action = ''"
+        )
+        self.connection.execute(
+            "UPDATE codex_workflows SET goal_sync_state = 'not_configured' WHERE goal_sync_state IS NULL OR goal_sync_state = ''"
+        )
         self._add_column_if_missing("codex_operations", "app_server_generation", "INTEGER")
+        self._add_column_if_missing("codex_operations", "latest_report_hash", "TEXT")
+        self._add_column_if_missing("codex_operations", "final_report_json", "TEXT")
         self._add_column_if_missing("codex_operations", "lease_owner", "TEXT")
         self._add_column_if_missing("codex_operations", "lease_expires_at", "TEXT")
         self._add_column_if_missing("codex_operations", "next_attempt_at", "TEXT")
@@ -907,6 +972,12 @@ class McpStorage:
         self._add_column_if_missing("pending_interactions", "risk_summary_json", "TEXT")
         self._add_column_if_missing("pending_interactions", "answer_schema_json", "TEXT")
         self._add_column_if_missing("pending_interactions", "response_redacted", "INTEGER NOT NULL DEFAULT 0")
+        self.connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_codex_workflows_review_thread
+            ON codex_workflows(review_thread_id)
+            """
+        )
         self.connection.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_codex_operations_lease
@@ -966,6 +1037,38 @@ class McpStorage:
             """
             CREATE INDEX IF NOT EXISTS idx_tracked_turn_progress_category
             ON tracked_turn_progress_events(category, severity, created_at)
+            """
+        )
+        self.connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS codex_thread_lifecycle_actions(
+              action_id TEXT PRIMARY KEY,
+              action_type TEXT NOT NULL,
+              thread_id TEXT NOT NULL,
+              project_id TEXT,
+              status TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              completed_at TEXT,
+              request_json TEXT NOT NULL,
+              result_json TEXT,
+              last_error TEXT,
+              app_server_generation INTEGER,
+              observed_event_id INTEGER,
+              target_turn_id TEXT
+            )
+            """
+        )
+        self.connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_codex_thread_lifecycle_thread
+            ON codex_thread_lifecycle_actions(thread_id, created_at)
+            """
+        )
+        self.connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_codex_thread_lifecycle_status
+            ON codex_thread_lifecycle_actions(status, updated_at)
             """
         )
 
@@ -1156,6 +1259,19 @@ class McpStorage:
         row = self.connection.execute(
             "SELECT * FROM tracked_turns WHERE turn_id = ? LIMIT 1",
             (turn_id,),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def get_latest_tracked_turn_for_thread(self, thread_id: str) -> dict[str, Any] | None:
+        row = self.connection.execute(
+            """
+            SELECT *
+            FROM tracked_turns
+            WHERE thread_id = ?
+            ORDER BY updated_at DESC, started_at DESC
+            LIMIT 1
+            """,
+            (thread_id,),
         ).fetchone()
         return dict(row) if row is not None else None
 
@@ -1423,11 +1539,27 @@ class McpStorage:
             "current_operation_id": None,
             "plan_operation_id": None,
             "execution_operation_id": None,
+            "review_operation_id": None,
+            "review_source_thread_id": None,
+            "review_thread_id": None,
+            "review_turn_id": None,
+            "review_target_json": None,
+            "review_delivery": None,
             "execution_turn_id": None,
             "latest_plan_item_id": None,
             "latest_plan_hash": None,
             "latest_report_hash": None,
             "final_report_json": None,
+            "goal_objective": None,
+            "goal_token_budget": None,
+            "goal_completion_action": "clear",
+            "goal_completion_objective": None,
+            "goal_sync_state": "not_configured",
+            "goal_app_server_json": None,
+            "goal_last_error": None,
+            "goal_last_synced_at": None,
+            "goal_cleared_at": None,
+            "goal_managed_hash": None,
             "last_error": None,
             "completed_at": None,
             "app_server_generation": None,
@@ -1439,16 +1571,26 @@ class McpStorage:
             INSERT INTO codex_workflows(
               workflow_id, workflow_kind, client_request_id, execution_client_request_id,
               current_operation_id, plan_operation_id, execution_operation_id,
+              review_operation_id, review_source_thread_id, review_thread_id, review_turn_id,
+              review_target_json, review_delivery,
               project_id, thread_id, plan_turn_id, execution_turn_id,
               latest_plan_item_id, latest_plan_hash, latest_report_hash, final_report_json,
+              goal_objective, goal_token_budget, goal_completion_action, goal_completion_objective,
+              goal_sync_state, goal_app_server_json, goal_last_error, goal_last_synced_at,
+              goal_cleared_at, goal_managed_hash,
               phase, status, last_error, created_at, updated_at, completed_at,
               app_server_generation, metadata_json
             )
             VALUES(
               :workflow_id, :workflow_kind, :client_request_id, :execution_client_request_id,
               :current_operation_id, :plan_operation_id, :execution_operation_id,
+              :review_operation_id, :review_source_thread_id, :review_thread_id, :review_turn_id,
+              :review_target_json, :review_delivery,
               :project_id, :thread_id, :plan_turn_id, :execution_turn_id,
               :latest_plan_item_id, :latest_plan_hash, :latest_report_hash, :final_report_json,
+              :goal_objective, :goal_token_budget, :goal_completion_action, :goal_completion_objective,
+              :goal_sync_state, :goal_app_server_json, :goal_last_error, :goal_last_synced_at,
+              :goal_cleared_at, :goal_managed_hash,
               :phase, :status, :last_error, :created_at, :updated_at, :completed_at,
               :app_server_generation, :metadata_json
             )
@@ -1464,6 +1606,12 @@ class McpStorage:
             "current_operation_id",
             "plan_operation_id",
             "execution_operation_id",
+            "review_operation_id",
+            "review_source_thread_id",
+            "review_thread_id",
+            "review_turn_id",
+            "review_target_json",
+            "review_delivery",
             "thread_id",
             "plan_turn_id",
             "execution_turn_id",
@@ -1471,6 +1619,16 @@ class McpStorage:
             "latest_plan_hash",
             "latest_report_hash",
             "final_report_json",
+            "goal_objective",
+            "goal_token_budget",
+            "goal_completion_action",
+            "goal_completion_objective",
+            "goal_sync_state",
+            "goal_app_server_json",
+            "goal_last_error",
+            "goal_last_synced_at",
+            "goal_cleared_at",
+            "goal_managed_hash",
             "phase",
             "status",
             "last_error",
@@ -1552,6 +1710,87 @@ class McpStorage:
         ).fetchall()
         return [dict(row) for row in rows]
 
+    def create_thread_lifecycle_action(self, row: dict[str, Any]) -> bool:
+        payload = {
+            "project_id": None,
+            "completed_at": None,
+            "result_json": None,
+            "last_error": None,
+            "app_server_generation": None,
+            "observed_event_id": None,
+            "target_turn_id": None,
+            **row,
+        }
+        cursor = self.connection.execute(
+            """
+            INSERT OR IGNORE INTO codex_thread_lifecycle_actions(
+              action_id, action_type, thread_id, project_id, status,
+              created_at, updated_at, completed_at, request_json, result_json,
+              last_error, app_server_generation, observed_event_id, target_turn_id
+            )
+            VALUES(
+              :action_id, :action_type, :thread_id, :project_id, :status,
+              :created_at, :updated_at, :completed_at, :request_json, :result_json,
+              :last_error, :app_server_generation, :observed_event_id, :target_turn_id
+            )
+            """,
+            payload,
+        )
+        self.connection.commit()
+        return cursor.rowcount > 0
+
+    def update_thread_lifecycle_action(self, action_id: str, **fields: Any) -> None:
+        allowed = {
+            "status",
+            "project_id",
+            "updated_at",
+            "completed_at",
+            "request_json",
+            "result_json",
+            "last_error",
+            "app_server_generation",
+            "observed_event_id",
+            "target_turn_id",
+        }
+        selected = {key: value for key, value in fields.items() if key in allowed}
+        if not selected:
+            return
+        assignments = ", ".join(f"{key} = :{key}" for key in selected)
+        self.connection.execute(
+            f"UPDATE codex_thread_lifecycle_actions SET {assignments} WHERE action_id = :action_id",
+            {**selected, "action_id": action_id},
+        )
+        self.connection.commit()
+
+    def get_thread_lifecycle_action(self, action_id: str) -> dict[str, Any] | None:
+        row = self.connection.execute(
+            "SELECT * FROM codex_thread_lifecycle_actions WHERE action_id = ? LIMIT 1",
+            (action_id,),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def list_thread_lifecycle_actions(self, *, thread_id: str | None = None, status: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if thread_id:
+            clauses.append("thread_id = ?")
+            params.append(thread_id)
+        if status:
+            clauses.append("status = ?")
+            params.append(status)
+        where = "WHERE " + " AND ".join(clauses) if clauses else ""
+        rows = self.connection.execute(
+            f"""
+            SELECT *
+            FROM codex_thread_lifecycle_actions
+            {where}
+            ORDER BY updated_at DESC
+            LIMIT ?
+            """,
+            (*params, limit),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
     def create_operation(self, row: dict[str, Any]) -> bool:
         payload = {
             "attempt_count": 0,
@@ -1560,6 +1799,8 @@ class McpStorage:
             "started_at": None,
             "completed_at": None,
             "app_server_generation": None,
+            "latest_report_hash": None,
+            "final_report_json": None,
             "lease_owner": None,
             "lease_expires_at": None,
             "next_attempt_at": None,
@@ -1574,6 +1815,7 @@ class McpStorage:
               project_id, chat_id, thread_id, turn_id, workflow_id, cwd, title,
               request_json, result_json, last_error, attempt_count,
               created_at, updated_at, started_at, completed_at, app_server_generation,
+              latest_report_hash, final_report_json,
               lease_owner, lease_expires_at, next_attempt_at, max_attempts, last_heartbeat_at
             )
             VALUES(
@@ -1581,6 +1823,7 @@ class McpStorage:
               :project_id, :chat_id, :thread_id, :turn_id, :workflow_id, :cwd, :title,
               :request_json, :result_json, :last_error, :attempt_count,
               :created_at, :updated_at, :started_at, :completed_at, :app_server_generation,
+              :latest_report_hash, :final_report_json,
               :lease_owner, :lease_expires_at, :next_attempt_at, :max_attempts, :last_heartbeat_at
             )
             """,
@@ -1608,6 +1851,8 @@ class McpStorage:
             "started_at",
             "completed_at",
             "app_server_generation",
+            "latest_report_hash",
+            "final_report_json",
             "lease_owner",
             "lease_expires_at",
             "next_attempt_at",
@@ -1776,7 +2021,7 @@ class McpStorage:
         placeholders = ",".join("?" for _ in startable)
         rows = self.connection.execute(
             f"""
-            SELECT operation_id, turn_id
+            SELECT operation_id, operation_type, thread_id, turn_id, request_json
             FROM codex_operations
             WHERE status IN ({placeholders})
               AND (lease_owner IS NULL OR lease_expires_at IS NULL OR lease_expires_at <= ?)
@@ -1785,6 +2030,8 @@ class McpStorage:
         ).fetchall()
         reset_ids: list[str] = []
         running_ids: list[str] = []
+        completed_ids: list[str] = []
+        unknown_ids: list[str] = []
         for row in rows:
             operation_id = str(row["operation_id"])
             if row["turn_id"]:
@@ -1813,6 +2060,64 @@ class McpStorage:
                     (now, operation_id),
                 )
             else:
+                payload: dict[str, Any] = {}
+                try:
+                    decoded = json.loads(str(row["request_json"] or "{}"))
+                    if isinstance(decoded, dict):
+                        payload = decoded
+                except json.JSONDecodeError:
+                    payload = {}
+                if (
+                    row["operation_type"] == "fork_thread"
+                    and row["thread_id"]
+                    and not str(payload.get("message") or "").strip()
+                ):
+                    completed_ids.append(operation_id)
+                    self.connection.execute(
+                        """
+                        UPDATE codex_operations
+                        SET status = 'completed',
+                            phase = 'completed',
+                            lease_owner = NULL,
+                            lease_expires_at = NULL,
+                            last_heartbeat_at = NULL,
+                            next_attempt_at = NULL,
+                            last_error = NULL,
+                            completed_at = ?,
+                            updated_at = ?
+                        WHERE operation_id = ?
+                        """,
+                        (now, now, operation_id),
+                    )
+                    self.connection.execute(
+                        """
+                        UPDATE codex_prompt_submissions
+                        SET status = 'completed',
+                            updated_at = ?
+                        WHERE operation_id = ?
+                        """,
+                        (now, operation_id),
+                    )
+                    continue
+                if row["operation_type"] == "review_start" and payload.get("_review_start_attempted"):
+                    unknown_ids.append(operation_id)
+                    self.connection.execute(
+                        """
+                        UPDATE codex_operations
+                        SET status = 'unknown_after_app_server_exit',
+                            phase = 'unknown_after_app_server_exit',
+                            lease_owner = NULL,
+                            lease_expires_at = NULL,
+                            last_heartbeat_at = NULL,
+                            next_attempt_at = NULL,
+                            last_error = COALESCE(last_error, 'MCP server restarted after review/start attempt before review turn id was persisted.'),
+                            completed_at = ?,
+                            updated_at = ?
+                        WHERE operation_id = ?
+                        """,
+                        (now, now, operation_id),
+                    )
+                    continue
                 reset_ids.append(operation_id)
                 self.connection.execute(
                     """
@@ -1837,7 +2142,12 @@ class McpStorage:
                     (now, operation_id),
                 )
         self.connection.commit()
-        return {"resetOperationIds": reset_ids, "runningOperationIds": running_ids}
+        return {
+            "resetOperationIds": reset_ids,
+            "runningOperationIds": running_ids,
+            "completedOperationIds": completed_ids,
+            "unknownOperationIds": unknown_ids,
+        }
 
     def get_operation(self, operation_id: str) -> dict[str, Any] | None:
         row = self.connection.execute(
