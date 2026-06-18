@@ -1622,7 +1622,14 @@ def _config_fingerprint_summary(config: ServerConfig) -> dict[str, Any]:
 
 
 def _config_fingerprint(config: ServerConfig) -> str:
-    payload = _config_fingerprint_summary(config)
+    summary = _config_fingerprint_summary(config)
+    payload = {
+        "codexHome": summary.get("codexHome"),
+        "sessionsDir": summary.get("sessionsDir"),
+        "codexStateDb": summary.get("codexStateDb"),
+        "stateDbPath": summary.get("stateDbPath"),
+        "allowedRoots": summary.get("allowedRoots"),
+    }
     return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
 
 

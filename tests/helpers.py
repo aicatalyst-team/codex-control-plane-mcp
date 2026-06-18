@@ -42,6 +42,7 @@ from openclaw_codex_mcp.tools import (
     ToolService,
     _approval_policy_for_send,
     _collaboration_mode,
+    _config_fingerprint,
     _sandbox_policy_for_send,
     _split_selected_messages,
     _tool_surface_hash,

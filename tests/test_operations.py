@@ -96,6 +96,19 @@ class McpDefinitionTests(unittest.TestCase):
         self.assertIsNone(stored["last_error"])
         self.assertIsNone(stored["worker_config_fingerprint"])
 
+    def test_config_fingerprint_ignores_codex_binary_revision_path(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            left = _search_service_config(root, root / ".codex" / "state_5.sqlite")
+            right = _search_service_config(root, root / ".codex" / "state_5.sqlite")
+            left.codex_binary_path = root / "Codex" / "bin" / "old-revision" / "codex.exe"
+            right.codex_binary_path = root / "Codex" / "bin" / "new-revision" / "codex.exe"
+
+            left_fingerprint = _config_fingerprint(left)
+            right_fingerprint = _config_fingerprint(right)
+
+        self.assertEqual(left_fingerprint, right_fingerprint)
+
     def test_turn_tracker_waits_first_message_and_records_completion(self) -> None:
         async def scenario() -> tuple[dict | None, dict | None]:
             with TemporaryDirectory() as tmp:
