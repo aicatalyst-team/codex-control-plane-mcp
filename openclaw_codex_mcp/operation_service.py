@@ -1427,12 +1427,6 @@ class OperationServiceMixin:
         if str(operation.get("status") or "") not in OPERATION_STARTABLE_STATUSES:
             return
         if self._operation_config_mismatch(operation):
-            self.storage.update_operation(
-                operation_id,
-                last_error="Operation belongs to a different MCP config fingerprint. Inspect diagnostics or set CODEX_MCP_ALLOW_CROSS_CONFIG_RECOVERY=1 for manual emergency recovery.",
-                worker_config_fingerprint=self._config_fingerprint,
-                updated_at=_now_iso(),
-            )
             return
         task = self._operation_tasks.get(operation_id)
         if task is not None and not task.done():

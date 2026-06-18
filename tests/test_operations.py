@@ -71,6 +71,31 @@ class McpDefinitionTests(unittest.TestCase):
         self.assertIsNone(repaired["final_report_json"])
         self.assertTrue(any(item["name"] == "premature_terminal_operation" for item in diagnostics["checks"]))
 
+    def test_config_mismatch_status_does_not_mutate_foreign_operation(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service = ToolService(_search_service_config(root, root / ".codex" / "state_5.sqlite"))
+            try:
+                operation = _storage_operation_row(
+                    "op-foreign-config",
+                    status="queued",
+                    thread_id="thread-foreign-config",
+                    cwd=str(root),
+                )
+                operation["submitter_config_fingerprint"] = "another-config"
+                service.storage.create_operation(operation)
+
+                status = service.codex_get_operation_status({"operation_id": "op-foreign-config"})
+                stored = service.storage.get_operation("op-foreign-config") or {}
+            finally:
+                asyncio.run(service.close())
+
+        self.assertEqual("queued", status["status"])
+        self.assertEqual("mismatch", status["configRecoveryState"]["state"])
+        self.assertEqual("queued", stored["status"])
+        self.assertIsNone(stored["last_error"])
+        self.assertIsNone(stored["worker_config_fingerprint"])
+
     def test_turn_tracker_waits_first_message_and_records_completion(self) -> None:
         async def scenario() -> tuple[dict | None, dict | None]:
             with TemporaryDirectory() as tmp:

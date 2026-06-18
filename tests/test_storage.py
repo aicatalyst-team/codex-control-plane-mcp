@@ -167,6 +167,7 @@ class OperationLeaseStorageTests(unittest.TestCase):
                     now="2026-05-25T00:00:00+00:00",
                     worker_config_fingerprint="worker-b",
                 )
+                after_mismatch = storage.get_operation("op-fingerprint") or {}
                 emergency = storage.acquire_operation_lease(
                     "op-fingerprint",
                     lease_owner="worker-b",
@@ -180,6 +181,8 @@ class OperationLeaseStorageTests(unittest.TestCase):
 
         self.assertIsNone(acquired)
         self.assertEqual([], [item["operation_id"] for item in listed])
+        self.assertIsNone(after_mismatch["worker_config_fingerprint"])
+        self.assertIsNone(after_mismatch["last_error"])
         self.assertIsNotNone(emergency)
         self.assertEqual("worker-b", emergency["lease_owner"])
 
