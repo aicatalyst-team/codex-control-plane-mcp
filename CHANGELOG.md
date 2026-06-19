@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on Keep a Changelog and this project uses semantic
 versioning after the public `0.1.0` release.
 
+## [0.1.4] - 2026-06-19
+
+### Added
+
+- Add agent guidance for status, diagnostics, preflight, and structured error
+  responses so MCP clients get a concrete next step instead of a dead-end
+  failure.
+- Add a persistent recovery loop guard ledger that tracks repair, restart, and
+  interrupt attempts by stable scope and action.
+
+### Changed
+
+- Document `agentGuidance`, `agentGuidanceText`, and loop guard behavior in the
+  API contract and OpenClaw client guides.
+- Keep Plan Mode runtime recovery explicit: repair actions still start with
+  `dry_run=true`, and clients must stop when `loopGuard.allowed=false`.
+
 ## [0.1.3] - 2026-06-18
 
 ### Added
