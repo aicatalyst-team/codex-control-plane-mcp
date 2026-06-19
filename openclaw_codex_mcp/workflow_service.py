@@ -471,6 +471,96 @@ class WorkflowServiceMixin:
             "available": sync_state != "unsupported",
         }
 
+    def codex_adopt_workflow_plan(self, args: dict[str, Any]) -> dict[str, Any]:
+        workflow_id = _required_string(args, "workflow_id")
+        candidate_turn_id = _required_string(args, "candidate_turn_id")
+        candidate_plan_hash = _required_string(args, "candidate_plan_hash")
+        workflow = self.storage.get_workflow(workflow_id)
+        if workflow is None:
+            raise invalid_argument("Codex workflow was not found.", workflow_id=workflow_id)
+        if str(workflow.get("workflow_kind") or "plan_then_execute") != "plan_then_execute":
+            raise invalid_argument("Only plan_then_execute workflows can adopt a plan.", workflow_id=workflow_id)
+        if _optional_string(workflow.get("execution_operation_id")) or _optional_string(workflow.get("execution_turn_id")):
+            raise invalid_argument("Workflow execution already started; plan adoption is no longer allowed.", workflow_id=workflow_id)
+
+        thread_id = _optional_string(workflow.get("thread_id"))
+        self._refresh_workflow_thread_tracking(workflow, thread_id=thread_id)
+        plan_rows = self.storage.get_tracked_turn_plans(candidate_turn_id)
+        matching: dict[str, Any] | None = None
+        for row in plan_rows:
+            text = str(row.get("text") or "")
+            if plan_hash_for_text(text) == candidate_plan_hash:
+                matching = row
+                break
+        if matching is None:
+            raise invalid_argument(
+                "Candidate plan was not found for this workflow thread.",
+                workflow_id=workflow_id,
+                candidate_turn_id=candidate_turn_id,
+                candidate_plan_hash=candidate_plan_hash,
+            )
+        if thread_id and _optional_string(matching.get("thread_id")) != thread_id:
+            raise invalid_argument(
+                "Candidate plan belongs to a different thread.",
+                workflow_id=workflow_id,
+                workflow_thread_id=thread_id,
+                candidate_thread_id=matching.get("thread_id"),
+            )
+        quality = classify_plan_artifact(matching.get("text"), matching.get("payload_json"))
+        if quality != "valid_plan":
+            raise invalid_argument(
+                "Candidate plan is not a valid proposed_plan artifact.",
+                workflow_id=workflow_id,
+                candidate_turn_id=candidate_turn_id,
+                planQuality=quality,
+            )
+
+        already_adopted = (
+            _optional_string(workflow.get("plan_turn_id")) == candidate_turn_id
+            and _optional_string(workflow.get("latest_plan_hash")) == candidate_plan_hash
+        )
+        now = _now_iso()
+        if not already_adopted:
+            self.storage.update_workflow(
+                workflow_id,
+                plan_turn_id=candidate_turn_id,
+                latest_plan_item_id=str(matching.get("item_id") or matching.get("id") or ""),
+                latest_plan_hash=candidate_plan_hash,
+                phase="plan_ready",
+                status="plan_ready",
+                last_error=None,
+                completed_at=None,
+                updated_at=now,
+            )
+            self.storage.record_workflow_event(
+                workflow_id,
+                event_type="workflow_plan_adopted",
+                message="Workflow plan adopted from a newer candidate turn.",
+                details={
+                    "candidateTurnId": candidate_turn_id,
+                    "candidatePlanHash": candidate_plan_hash,
+                    "clientRequestId": _optional_string(args.get("client_request_id")),
+                    "adoptionNote": _optional_string(args.get("adoption_note")),
+                },
+                created_at=now,
+            )
+        refreshed = self.storage.get_workflow(workflow_id) or workflow
+        status = self._workflow_status_payload(
+            refreshed,
+            last_messages=10,
+            message_max_chars=_bounded_int(args.get("message_max_chars", 8000), 500, 200000),
+            include_events=True,
+        )
+        status["idempotent"] = already_adopted
+        status["idempotencyScope"] = "adopt_plan"
+        status["adoptedPlan"] = {
+            "turnId": candidate_turn_id,
+            "planHash": candidate_plan_hash,
+            "itemId": matching.get("item_id"),
+            "quality": quality,
+        }
+        return status
+
     def codex_approve_plan(self, args: dict[str, Any]) -> dict[str, Any]:
         workflow_id = _required_string(args, "workflow_id")
         workflow = self.storage.get_workflow(workflow_id)
@@ -514,6 +604,14 @@ class WorkflowServiceMixin:
                 "Workflow has no completed Plan Mode plan item yet.",
                 workflow_id=workflow_id,
                 plan_turn_id=plan_turn_id,
+            )
+        latest_plan_quality = classify_plan_artifact(latest_plan_text, latest_plan.get("payload_json"))
+        if latest_plan_quality != "valid_plan":
+            raise invalid_argument(
+                "Workflow latest plan is not a valid proposed_plan artifact; review or adopt a valid candidate plan first.",
+                workflow_id=workflow_id,
+                plan_turn_id=plan_turn_id,
+                planQuality=latest_plan_quality,
             )
 
         plan_hash = prompt_hash(normalize_prompt(latest_plan_text))
@@ -589,6 +687,7 @@ class WorkflowServiceMixin:
             )
         workflow = self._sync_workflow_state(workflow, last_messages=last_messages, message_max_chars=message_max_chars)
         thread_id = _optional_string(workflow.get("thread_id"))
+        thread_refresh = self._refresh_workflow_thread_tracking(workflow, thread_id=thread_id)
         plan_turn_id = _optional_string(workflow.get("plan_turn_id"))
         execution_turn_id = _optional_string(workflow.get("execution_turn_id"))
         plan_operation_id = _optional_string(workflow.get("plan_operation_id"))
@@ -643,6 +742,14 @@ class WorkflowServiceMixin:
                 plan_rows = self.storage.get_tracked_turn_plans(plan_turn_id)
         plans = [_plan_row_to_tool(row, message_max_chars) for row in plan_rows] if plan_turn_id else []
         latest_plan = _latest_plan(plans)
+        workflow_observation = self._workflow_observation(
+            workflow,
+            thread_id=thread_id,
+            official_plan_turn_id=plan_turn_id,
+            latest_plan=latest_plan,
+            thread_refresh=thread_refresh,
+            message_max_chars=message_max_chars,
+        )
         plan_updates: dict[str, Any] = {}
         if latest_plan is not None:
             latest_plan_text = str(latest_plan.get("markdown") or "")
@@ -673,6 +780,15 @@ class WorkflowServiceMixin:
             plan_operation=plan_operation,
             execution_operation=execution_operation,
         )
+        if (
+            workflow_observation.get("recoverableCandidateFound")
+            and not execution_turn_id
+            and not execution_operation_id
+            and phase in {"failed", "plan_ready", "plan_needs_review", "orphaned_after_app_server_exit"}
+        ):
+            phase = "plan_candidate_found"
+            status = "plan_candidate_found"
+            last_error = None
         now = _now_iso()
         completed_at = workflow.get("completed_at")
         if status in {"completed", "failed", "orphaned_after_app_server_exit"} and not completed_at:
@@ -752,12 +868,13 @@ class WorkflowServiceMixin:
             "executionTurn": execution_turn,
             "plans": plans,
             "latestPlan": latest_plan,
+            "workflowObservation": workflow_observation,
             "finalReport": final_report,
             "threadGoal": self._workflow_goal_status(workflow),
             "pendingInteractions": pending_interactions,
             "nextRecommendedAction": _next_workflow_action(phase),
             "recommendedPollAfterSeconds": _workflow_poll_seconds(phase),
-            "pollRecommended": phase not in {"completed", "failed", "orphaned_after_app_server_exit"},
+            "pollRecommended": phase not in {"plan_ready", "plan_needs_review", "plan_candidate_found", "completed", "failed", "orphaned_after_app_server_exit"},
             "appServerGeneration": self._app_server.process_generation
             if self._app_server is not None
             else workflow.get("app_server_generation"),
@@ -767,6 +884,126 @@ class WorkflowServiceMixin:
         if include_events:
             result["events"] = [_workflow_event_to_tool(row) for row in self.storage.list_workflow_events(workflow_id, limit=20)]
         return result
+
+    def _refresh_workflow_thread_tracking(self, workflow: dict[str, Any], *, thread_id: str | None) -> dict[str, Any]:
+        if not thread_id:
+            return {"imported": False, "reason": "missing_thread_id"}
+        status = str(workflow.get("status") or "")
+        phase = str(workflow.get("phase") or "")
+        should_refresh = status in {
+            "failed",
+            "plan_ready",
+            "plan_needs_review",
+            "completed",
+            "orphaned_after_app_server_exit",
+            "unknown_after_app_server_exit",
+        } or phase in {
+            "failed",
+            "plan_ready",
+            "plan_needs_review",
+            "completed",
+            "orphaned_after_app_server_exit",
+            "unknown_after_app_server_exit",
+        }
+        if not should_refresh:
+            return {"imported": False, "reason": "not_needed"}
+        refresh = getattr(self, "_refresh_thread_tracking_from_transcript", None)
+        if not callable(refresh):
+            return {"imported": False, "reason": "importer_unavailable"}
+        return refresh(thread_id)
+
+    def _workflow_observation(
+        self,
+        workflow: dict[str, Any],
+        *,
+        thread_id: str | None,
+        official_plan_turn_id: str | None,
+        latest_plan: dict[str, Any] | None,
+        thread_refresh: dict[str, Any],
+        message_max_chars: int,
+    ) -> dict[str, Any]:
+        if not thread_id:
+            return {
+                "available": False,
+                "reason": "thread_not_known_yet",
+                "candidatePlans": [],
+                "candidateReports": [],
+                "warnings": [],
+            }
+
+        latest_turn = self.storage.get_latest_tracked_turn_for_thread(thread_id)
+        official_quality = (
+            str(latest_plan.get("planQuality") or latest_plan.get("quality") or classify_plan_text(latest_plan.get("markdown") or latest_plan.get("text")))
+            if latest_plan
+            else None
+        )
+        plan_rows = self.storage.get_thread_plans(thread_id, limit=100)
+        candidate_plans: list[dict[str, Any]] = []
+        for row in plan_rows:
+            turn_id = str(row.get("turn_id") or "")
+            text = str(row.get("text") or "")
+            candidate_quality = classify_plan_artifact(text, row.get("payload_json"))
+            candidate = plan_candidate_payload(
+                turn_id=turn_id,
+                thread_id=str(row.get("thread_id") or thread_id),
+                item_id=str(row.get("item_id") or ""),
+                text=text,
+                source=_plan_source(row),
+                created_at=_optional_string(row.get("created_at")),
+                updated_at=_optional_string(row.get("updated_at")),
+                completed_at=_optional_string(row.get("completed_at")),
+                max_chars=message_max_chars,
+            )
+            candidate["quality"] = candidate_quality
+            candidate["planQuality"] = candidate_quality
+            candidate["valid"] = candidate_quality == "valid_plan"
+            candidate["requiresReview"] = candidate_quality in {"needs_review", "partial", "unknown"}
+            candidate["isBlocker"] = candidate_quality in {"blocker", "refusal"}
+            if turn_id == official_plan_turn_id:
+                continue
+            if candidate_quality == "valid_plan":
+                candidate_plans.append(candidate)
+
+        latest_turn_id = _optional_string((latest_turn or {}).get("turn_id"))
+        latest_turn_updated = _optional_string((latest_turn or {}).get("updated_at")) or _optional_string((latest_turn or {}).get("completed_at"))
+        official_turn = self.storage.get_tracked_turn(official_plan_turn_id) if official_plan_turn_id else None
+        official_updated = _optional_string((official_turn or {}).get("updated_at")) or _optional_string((official_turn or {}).get("completed_at"))
+        thread_advanced = bool(
+            latest_turn_id
+            and official_plan_turn_id
+            and latest_turn_id != official_plan_turn_id
+            and (not official_updated or not latest_turn_updated or latest_turn_updated >= official_updated)
+        )
+        warnings: list[str] = []
+        if official_quality in {"blocker", "refusal"}:
+            warnings.append("Official workflow plan turn completed with a blocker/refusal.")
+        if thread_advanced:
+            warnings.append("Thread has newer turn activity after the official workflow plan turn.")
+        if candidate_plans:
+            warnings.append("A newer valid plan candidate is available in the same thread.")
+
+        source_parts = []
+        if latest_turn and latest_turn.get("source"):
+            source_parts.append(str(latest_turn.get("source")))
+        if thread_refresh.get("source"):
+            source_parts.append(str(thread_refresh.get("source")))
+        source = "+".join(sorted(set(source_parts))) or "storage"
+        return {
+            "available": True,
+            "officialPlanTurnId": official_plan_turn_id,
+            "officialPlanQuality": official_quality,
+            "latestThreadTurnId": latest_turn_id,
+            "latestThreadStatus": (latest_turn or {}).get("status"),
+            "latestThreadUpdatedAt": latest_turn_updated,
+            "threadAdvancedAfterOfficialTurn": thread_advanced,
+            "recoverableCandidateFound": bool(candidate_plans),
+            "candidatePlans": candidate_plans,
+            "candidateReports": [],
+            "importStatus": thread_refresh,
+            "source": source,
+            "confidence": "high" if candidate_plans else ("medium" if latest_turn else "low"),
+            "warnings": warnings,
+        }
 
     def _sync_workflow_state(
         self,
@@ -911,4 +1148,16 @@ class WorkflowServiceMixin:
             )
         except CodexMcpError:
             return None
+
+
+def _plan_source(row: dict[str, Any]) -> str:
+    raw = row.get("payload_json")
+    if isinstance(raw, str) and raw.strip():
+        try:
+            payload = json.loads(raw)
+            if isinstance(payload, dict) and payload.get("source"):
+                return str(payload.get("source"))
+        except json.JSONDecodeError:
+            return "storage"
+    return "storage"
 

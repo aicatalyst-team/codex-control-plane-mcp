@@ -284,6 +284,23 @@ def analyze_context(problem_text: str | None, diagnostics: dict[str, Any], logs:
                 confidence="medium",
             )
         )
+    if any(marker in haystack for marker in ("createprocessasuserw failed: 5", "windows sandbox: runner error", "access is denied")):
+        findings.append(
+            finding(
+                "windows_sandbox_spawn_denied",
+                "error",
+                "Codex could not spawn a Windows sandboxed process for the configured project run.",
+                evidence=_matching_evidence(
+                    log_entries,
+                    event_entries,
+                    ("createprocessasuserw failed: 5", "windows sandbox: runner error", "access is denied"),
+                ),
+                recommended_actions=[
+                    action("validate_paths_and_config", expected_effect="Run project preflight and verify sandbox/path configuration before retry."),
+                ],
+                confidence="high",
+            )
+        )
     if any(marker in haystack for marker in ("duplicate prompt", "codex_duplicate_prompt_active", "duplicate_prompt_active")):
         findings.append(
             finding(
@@ -344,6 +361,38 @@ def analyze_context(problem_text: str | None, diagnostics: dict[str, Any], logs:
                 confidence="medium",
             )
         )
+    workflow_observation = diagnostics.get("workflowObservation") if isinstance(diagnostics.get("workflowObservation"), dict) else None
+    if workflow_observation:
+        if workflow_observation.get("threadAdvancedAfterOfficialTurn"):
+            findings.append(
+                finding(
+                    "workflow_thread_drift",
+                    "warning",
+                    "Workflow state is older than the observed Codex thread tail.",
+                    evidence=[redact_payload(workflow_observation)],
+                    confidence=str(workflow_observation.get("confidence") or "medium"),
+                )
+            )
+        if workflow_observation.get("recoverableCandidateFound"):
+            findings.append(
+                finding(
+                    "workflow_recoverable_candidate_found",
+                    "warning",
+                    "A newer valid plan/report candidate is available for workflow recovery.",
+                    evidence=[redact_payload(workflow_observation)],
+                    confidence=str(workflow_observation.get("confidence") or "medium"),
+                )
+            )
+        if workflow_observation.get("officialPlanQuality") in {"blocker", "refusal"}:
+            findings.append(
+                finding(
+                    "invalid_plan_artifact",
+                    "error",
+                    "The official workflow plan artifact is a blocker/refusal, not an executable plan.",
+                    evidence=[redact_payload(workflow_observation)],
+                    confidence="high",
+                )
+            )
 
     for turn in diagnostics.get("activeWork", {}).get("activeTurns") or []:
         status = str(turn.get("status") or "")
@@ -439,6 +488,10 @@ def next_steps_for_findings(findings: list[dict[str, Any]]) -> list[str]:
     steps: list[str] = []
     if "codex_auth_required" in categories:
         steps.append("Verify the configured CODEX_HOME has Codex authentication, for example auth.json or an equivalent login.")
+    if "windows_sandbox_spawn_denied" in categories:
+        steps.append("Run codex_preflight_project_run for the affected cwd and sandbox before retrying the long workflow.")
+    if "workflow_recoverable_candidate_found" in categories:
+        steps.append("Review workflowObservation.candidatePlans and adopt the valid candidate before approving execution.")
     if categories & {"app_server_stdout_closed", "app_server_not_running", "app_server_exited"}:
         steps.append("Inspect recent MCP log lines and app_server_events around the last processGeneration.")
     if categories & {"stale_turn", "stale_operation"}:

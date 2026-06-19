@@ -173,6 +173,7 @@ class ChatServiceMixin:
         chat = self._resolve_chat_for_read(chat_id, str(project_id) if project_id else None)
         if chat is None:
             raise thread_not_found(chat_id)
+        self._refresh_thread_tracking_from_transcript(chat.thread_id, chat=chat)
         parsed, source_info = self._load_chat_summary(
             chat,
             archived=chat.archived,
@@ -213,6 +214,7 @@ class ChatServiceMixin:
         chat = self._resolve_chat_for_read(chat_id, str(project_id) if project_id else None)
         if chat is None:
             raise thread_not_found(chat_id)
+        self._refresh_thread_tracking_from_transcript(chat.thread_id, chat=chat)
         summary, source_info = self._load_chat_summary(
             chat,
             archived=chat.archived,
@@ -462,6 +464,26 @@ class ChatServiceMixin:
                 source="kb_history",
             )
         return None
+
+    def _refresh_thread_tracking_from_transcript(self, thread_id: str, *, chat: Chat | None = None) -> dict[str, Any]:
+        if not thread_id:
+            return {"imported": False, "reason": "missing_thread_id"}
+        target_chat = chat or self._resolve_chat_for_read(thread_id, None)
+        if target_chat is None:
+            return {"imported": False, "reason": "chat_not_found"}
+        transcript_path = self.catalog.locate_transcript(target_chat)
+        if not transcript_path:
+            return {"imported": False, "reason": "transcript_not_found"}
+        if str(transcript_path).startswith((HOOK_HISTORY_PREFIX, TRACKED_TURN_HISTORY_PREFIX)):
+            return {"imported": False, "reason": "virtual_history_source", "source": transcript_path.split(":", 1)[0]}
+        path = Path(transcript_path)
+        if not path.exists() or not path.is_file():
+            return {"imported": False, "reason": "transcript_not_readable"}
+        try:
+            return import_transcript_to_tracking(self.storage, path, archived=target_chat.archived)
+        except Exception as exc:
+            LOG.warning("transcript import failed thread_id=%s path=%s error=%s", thread_id, path, exc)
+            return {"imported": False, "reason": "transcript_import_failed", "error": redact_text(str(exc), max_chars=500)}
 
     def _tracked_turn_transcript_summary(self, thread_id: str, *, chat: Chat) -> TranscriptSummary:
         turn_rows = self.storage.list_tracked_turns_for_thread(thread_id)

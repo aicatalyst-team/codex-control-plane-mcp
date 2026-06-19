@@ -110,6 +110,14 @@ class McpDefinitionTests(unittest.TestCase):
         self.assertEqual("codex_auth_required", auth_analysis["likelyRootCause"]["category"])
         self.assertIn("reauthenticate_codex_home", [item["action"] for item in auth_analysis["recommendedRepairActions"]])
 
+        sandbox_analysis = analyze_context(
+            "windows sandbox: runner error: CreateProcessAsUserW failed: 5",
+            {"checks": [], "activeWork": {"activeTurns": [], "pendingInteractions": 0}},
+            {"logs": [{"message": "CreateProcessAsUserW failed: 5"}], "events": []},
+        )
+        self.assertEqual("windows_sandbox_spawn_denied", sandbox_analysis["likelyRootCause"]["category"])
+        self.assertIn("Run codex_preflight_project_run", " ".join(sandbox_analysis["nextDiagnosticSteps"]))
+
         operation_analysis = analyze_context(
             "CODEX_DUPLICATE_PROMPT_ACTIVE and stale operation",
             {

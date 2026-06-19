@@ -11,6 +11,7 @@ from typing import Any
 from .config import path_key
 from .pending_interactions import interaction_row_to_tool
 from .statuses import TURN_ACTIVE_STATUSES, TURN_COMPLETION_OBSERVED_STATUSES, TURN_TERMINAL_STATUSES
+from .plan_quality import classify_plan_artifact, plan_quality_payload
 from .storage import McpStorage
 
 
@@ -1103,7 +1104,8 @@ def _visible_last_error(turn: dict[str, Any]) -> str | None:
 
 
 def _plan_to_tool(row: dict[str, Any], max_chars: int) -> dict[str, Any]:
-    text = _truncate(row.get("text"), max_chars)
+    raw_text = str(row.get("text") or "")
+    text = _truncate(raw_text, max_chars)
     return {
         "item_id": row.get("item_id"),
         "itemId": row.get("item_id"),
@@ -1121,6 +1123,8 @@ def _plan_to_tool(row: dict[str, Any], max_chars: int) -> dict[str, Any]:
         "completed_at": row.get("completed_at"),
         "completedAt": row.get("completed_at"),
         "truncated": isinstance(row.get("text"), str) and len(str(row.get("text"))) > max_chars,
+        "planQuality": classify_plan_artifact(raw_text, row.get("payload_json")),
+        **plan_quality_payload(raw_text, row.get("payload_json")),
     }
 
 

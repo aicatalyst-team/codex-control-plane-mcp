@@ -165,6 +165,7 @@ or phases.
 | Find old work | `codex_search_chats` | `threadId`, `chatId`, `projectId` |
 | Read a chat | `codex_get_chat` | messages, source |
 | Check runtime | `codex_get_runtime_capabilities` | cached runtime snapshot |
+| Preflight a long run | `codex_preflight_project_run` | ready/degraded/failed checks |
 | Diagnose a failure | `codex_collect_diagnostics` | issue summary, repair hints |
 | Repair MCP state | `codex_repair_issue` | repair result |
 | Archive a thread | `codex_archive_thread` | lifecycle action |
@@ -242,6 +243,8 @@ Plan workflow actions:
 
 - `wait_plan`: keep polling;
 - `review_plan`: show the plan to a human or policy engine;
+- `adopt_candidate_plan`: review `workflowObservation.candidatePlans` and call
+  `codex_adopt_workflow_plan` if the candidate is valid;
 - `execute_plan`: call `codex_approve_plan`;
 - `answer_pending_interaction`: handle pending approval or question;
 - `wait_execution`: keep polling execution;
@@ -254,6 +257,51 @@ Review workflow actions:
 - `read_review_report`: read `finalReport`;
 - `answer_pending_interaction`: handle pending approval or question;
 - `inspect_diagnostics`: run diagnostics.
+
+### Workflow recovery cross-check
+
+Do not mark an OpenClaw run as blocked from `workflow.status` alone. A Codex
+thread can advance after the official workflow turn, especially when a human
+opens Codex Desktop, grants access, or sends a follow-up message in the same
+thread.
+
+When a workflow returns `failed`, `plan_needs_review`, `plan_candidate_found`,
+`orphaned`, or a suspicious `plan_ready`, do this before blocking the run:
+
+1. Read `workflowObservation`.
+2. If `recoverableCandidateFound == true`, inspect `candidatePlans`.
+3. Call `codex_get_chat` for the workflow `threadId`.
+4. Call `codex_collect_diagnostics` with `workflow_id`.
+5. Verify the external side effect for the business task, such as a YouTrack
+   comment id, a file change, or a report marker.
+
+`workflowObservation` is a drift detector. Important fields:
+
+- `officialPlanTurnId`: the turn currently attached to the workflow.
+- `officialPlanQuality`: MCP's quality classification for that plan.
+- `threadAdvancedAfterOfficialTurn`: later turns exist in the same thread.
+- `recoverableCandidateFound`: a later valid plan/report candidate was found.
+- `candidatePlans`: valid plan candidates from the same thread, with
+  `turnId`, `planHash`, `quality`, and `markdown`.
+
+If `nextRecommendedAction == "adopt_candidate_plan"`, the correct recovery path
+is:
+
+```json
+{
+  "tool": "codex_adopt_workflow_plan",
+  "arguments": {
+    "workflow_id": "WORKFLOW_ID",
+    "candidate_turn_id": "CANDIDATE_TURN_ID",
+    "candidate_plan_hash": "CANDIDATE_PLAN_HASH",
+    "client_request_id": "openclaw:issue-123:adopt-plan:v1"
+  }
+}
+```
+
+After adoption, poll `codex_get_workflow_status` again. Only call
+`codex_approve_plan` when `latestPlan.planQuality == "valid_plan"` and the
+plan matches the task.
 
 ## New task: `start_chat`
 
@@ -795,6 +843,40 @@ Decision rules:
 Account fields are redacted. Do not try to extract email or account identifiers
 from diagnostics.
 
+## Project preflight
+
+Before a multi-hour run, call `codex_preflight_project_run`. It checks the
+project path, allowed roots, Codex home, auth state, hooks, runtime inventory,
+and optional live turn startup.
+
+```json
+{
+  "tool": "codex_preflight_project_run",
+  "arguments": {
+    "project_id": "PROJECT_ID",
+    "cwd": "PROJECT_ROOT",
+    "model": "gpt-5.4",
+    "sandbox": "read-only",
+    "approval_policy": "on-request",
+    "workflow_kind": "plan_then_execute",
+    "live_probe": false,
+    "timeout_seconds": 2
+  }
+}
+```
+
+Decision rules:
+
+- `status == "ready"`: the run can start.
+- `status == "degraded"`: start only if the degraded check is acceptable for
+  this task.
+- `status == "failed"`: do not start. Read `checks` and fix the environment or
+  change the runtime policy.
+
+Use `live_probe=true` only when the client is allowed to create a small safe
+Codex turn. The probe uses a `MCP PREFLIGHT / DO NOT MODIFY FILES` marker and
+returns a normal durable operation id.
+
 ## Health summary
 
 `codex_health_summary` is lightweight. Call it for:
@@ -1100,11 +1182,13 @@ Markers help search, diagnostics, and humans in Codex Desktop.
 ### Plan Mode with approval
 
 1. Call `codex_start_plan_workflow`.
-2. Poll `codex_get_workflow_status` until `review_plan`.
-3. Show the plan to a human or policy engine.
-4. Call `codex_approve_plan` with a new `client_request_id`.
-5. Poll workflow until `read_final_report`.
-6. Store `finalReport`.
+2. Poll `codex_get_workflow_status`.
+3. If action is `adopt_candidate_plan`, review the candidate and call
+   `codex_adopt_workflow_plan`.
+4. When action is `review_plan`, show the plan to a human or policy engine.
+5. Call `codex_approve_plan` with a new `client_request_id`.
+6. Poll workflow until `read_final_report`.
+7. Store `finalReport`.
 
 ### Code review
 
@@ -1175,6 +1259,11 @@ Creates a durable code review workflow through app-server `review/start`.
 
 Main polling endpoint for plan and review workflows.
 
+#### `codex_adopt_workflow_plan`
+
+Adopts a later valid plan candidate from the same workflow thread. Use it only
+after checking `workflowObservation.candidatePlans`.
+
 #### `codex_approve_plan`
 
 Starts execution after a completed plan. Repeated approve must not create a
@@ -1212,6 +1301,11 @@ Poll endpoint for compaction.
 
 Runtime inventory for models, permission profiles, sandbox readiness, hooks,
 skills, provider capabilities, account status, usage bands, and rate limits.
+
+#### `codex_preflight_project_run`
+
+Checks whether a concrete project run is ready to start. Use it before
+multi-hour autonomous work.
 
 #### `codex_health_summary`
 

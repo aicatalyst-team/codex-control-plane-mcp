@@ -223,6 +223,18 @@ class DiagnosticServiceMixin:
         hook_history = self._hook_history_snapshot()
         correlation = self._diagnostic_correlation(context)
         progress_journal = self._progress_journal_snapshot(context, limit=event_limit)
+        workflow_observation = None
+        if workflow is not None:
+            try:
+                workflow_status = self._workflow_status_payload(
+                    workflow,
+                    last_messages=5,
+                    message_max_chars=8000,
+                    include_events=False,
+                )
+                workflow_observation = workflow_status.get("workflowObservation")
+            except Exception as exc:
+                workflow_observation = {"available": False, "error": redact_text(str(exc), max_chars=500)}
         timeline = (
             self._diagnostic_timeline(context=context, app_events=events, pending_interactions=pending, limit=timeline_limit)
             if bool(args.get("include_timeline", True))
@@ -269,6 +281,7 @@ class DiagnosticServiceMixin:
             "operationSummary": _operation_summary_to_tool(context["operation"]) if context["operation"] is not None else None,
             "operations": [_operation_summary_to_tool(row) for row in context["operations"]],
             "workflowSummary": [_workflow_summary_to_tool(row) for row in workflows if row is not None],
+            "workflowObservation": workflow_observation,
             "promptSubmissions": [_prompt_submission_summary_to_tool(row) for row in context["promptSubmissions"]],
             "correlation": correlation,
             "progressJournal": progress_journal,
@@ -438,6 +451,9 @@ class DiagnosticServiceMixin:
             changed = bool(repair_result.get("correctedOperationIds") or repair_result.get("refreshedFinalReportOperationIds"))
         elif action_name == "refresh_catalog_and_history":
             repair_result = self._repair_refresh_catalog_and_history(args, dry_run=dry_run)
+            changed = bool(repair_result.get("changed"))
+        elif action_name == "reconcile_workflow_from_thread":
+            repair_result = self._repair_reconcile_workflow_from_thread(args, dry_run=dry_run)
             changed = bool(repair_result.get("changed"))
         elif action_name == "mark_orphaned_after_exit":
             repair_result = self._repair_mark_orphaned_after_exit(args, dry_run=dry_run, force=force)
@@ -1138,6 +1154,41 @@ class DiagnosticServiceMixin:
             "searchIndexRefresh": status.to_tool(),
             "hookHistory": self._hook_history_snapshot(),
             "changed": True,
+        }
+
+    def _repair_reconcile_workflow_from_thread(self, args: dict[str, Any], *, dry_run: bool) -> dict[str, Any]:
+        workflow_id = _required_string(args, "workflow_id")
+        workflow = self.storage.get_workflow(workflow_id)
+        if workflow is None:
+            raise invalid_argument("Codex workflow was not found.", workflow_id=workflow_id)
+        thread_id = _optional_string(workflow.get("thread_id"))
+        if dry_run:
+            return {
+                "dryRun": True,
+                "changed": False,
+                "workflowId": workflow_id,
+                "threadId": thread_id,
+                "wouldImportTranscript": bool(thread_id),
+                "wouldRecomputeWorkflowObservation": True,
+            }
+        import_status = self._refresh_workflow_thread_tracking(workflow, thread_id=thread_id)
+        status = self._workflow_status_payload(
+            self.storage.get_workflow(workflow_id) or workflow,
+            last_messages=10,
+            message_max_chars=8000,
+            include_events=True,
+        )
+        observation = status.get("workflowObservation") or {}
+        return {
+            "dryRun": dry_run,
+            "changed": bool(import_status.get("imported")) and not dry_run,
+            "workflowId": workflow_id,
+            "threadId": thread_id,
+            "importStatus": import_status,
+            "workflowObservation": observation,
+            "candidatePlans": observation.get("candidatePlans") if isinstance(observation, dict) else [],
+            "nextRecommendedAction": status.get("nextRecommendedAction"),
+            "message": "Review candidatePlans and call codex_adopt_workflow_plan explicitly when a candidate is acceptable.",
         }
 
     def _repair_mark_orphaned_after_exit(self, args: dict[str, Any], *, dry_run: bool, force: bool) -> dict[str, Any]:

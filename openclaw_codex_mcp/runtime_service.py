@@ -300,3 +300,125 @@ class RuntimeServiceMixin:
         self._runtime_capabilities_cache_at = time.monotonic()
         return result
 
+    async def codex_preflight_project_run(self, args: dict[str, Any]) -> dict[str, Any]:
+        project_id = _optional_string(args.get("project_id"))
+        cwd = _optional_string(args.get("cwd"))
+        if project_id and not cwd:
+            project = self.catalog.get_project(project_id)
+            if project is None:
+                raise project_not_found(project_id)
+            cwd = project.path
+        if not cwd:
+            cwd = str(self.config.projects_root)
+        if not project_id:
+            project_id = project_id_for_path(cwd)
+        if not is_allowed_path(cwd, self.config.allowed_roots):
+            raise invalid_argument("cwd is outside configured allowed roots.", cwd=redact_text(cwd, max_chars=300))
+
+        timeout_seconds = _bounded_int(args.get("timeout_seconds", 30), 1, 300)
+        sandbox = _optional_string(args.get("sandbox")) or _sandbox_value_from_policy(self.config.default_sandbox_policy)
+        approval_policy = _optional_string(args.get("approval_policy")) or self.config.default_approval_policy
+        model = _optional_string(args.get("model")) or self.config.default_model
+        checks: list[dict[str, Any]] = []
+
+        def add_check(name: str, status: str, message: str, **details: Any) -> None:
+            checks.append({"name": name, "status": status, "message": message, "details": redact_payload(details)})
+
+        cwd_path = Path(cwd)
+        add_check("cwd_exists", "ok" if cwd_path.exists() else "error", "Project cwd exists." if cwd_path.exists() else "Project cwd does not exist.", cwd=str(cwd_path))
+        add_check("allowed_root", "ok", "Project cwd is inside CODEX_ALLOWED_ROOTS.", cwd=str(cwd_path))
+        add_check(
+            "codex_home",
+            "ok" if self.config.codex_home.exists() else "warning",
+            "Configured CODEX_HOME exists." if self.config.codex_home.exists() else "Configured CODEX_HOME does not exist yet.",
+            codexHome=str(self.config.codex_home),
+        )
+        add_check(
+            "codex_binary",
+            "ok" if self.config.codex_binary_path.exists() else "error",
+            "Codex binary exists." if self.config.codex_binary_path.exists() else "Codex binary was not found.",
+            codexBinaryPath=str(self.config.codex_binary_path),
+        )
+        add_check(
+            "auth_file",
+            "ok" if (self.config.codex_home / "auth.json").exists() else "warning",
+            "Codex auth.json is present." if (self.config.codex_home / "auth.json").exists() else "Codex auth.json was not found.",
+        )
+        hook_status = installed_hook_status(codex_home=self.config.codex_home)
+        add_check(
+            "hooks",
+            "ok" if hook_status.get("installed") else "warning",
+            "Codex MCP hooks are installed." if hook_status.get("installed") else "Codex MCP hooks are not installed.",
+            hookStatus=hook_status,
+        )
+
+        capabilities = await self.codex_get_runtime_capabilities(
+            {
+                "refresh": bool(args.get("refresh", False)),
+                "cwd": cwd,
+                "timeout_seconds": min(timeout_seconds, 10),
+                "include_models": True,
+                "include_hooks": True,
+                "include_skills": False,
+                "include_account": True,
+            }
+        )
+        runtime = capabilities.get("runtimeCapabilities") or {}
+        account = runtime.get("accountStatus") if isinstance(runtime.get("accountStatus"), dict) else {}
+        add_check(
+            "account",
+            "ok" if account.get("authenticated") else "error",
+            "Codex account is authenticated." if account.get("authenticated") else "Codex account is not authenticated.",
+            accountStatus=account,
+        )
+
+        live_probe = bool(args.get("live_probe", False))
+        probe_operation = None
+        if live_probe:
+            probe_operation = self.codex_submit_task(
+                {
+                    "operation_type": "start_chat",
+                    "project_id": project_id,
+                    "cwd": cwd,
+                    "message": "MCP PREFLIGHT / DO NOT MODIFY FILES\nConfirm briefly that this Codex turn can read the current workspace. Do not modify files.",
+                    "title": "MCP preflight probe",
+                    "model": model,
+                    "sandbox": sandbox,
+                    "approval_policy": approval_policy,
+                    "client_request_id": f"preflight:{path_key(cwd)}:{int(time.time())}",
+                    "timeout_seconds": timeout_seconds,
+                    "first_message_max_chars": 2000,
+                }
+            )
+            add_check(
+                "live_probe",
+                "ok" if probe_operation.get("ok") else "error",
+                "Live probe operation was submitted." if probe_operation.get("ok") else "Live probe operation failed to submit.",
+                operationId=probe_operation.get("operationId"),
+                error=probe_operation.get("error"),
+            )
+        else:
+            add_check("live_probe", "skipped", "live_probe=false; no Codex turn was started.")
+
+        status = "ok"
+        if any(item["status"] == "error" for item in checks):
+            status = "error"
+        elif any(item["status"] == "warning" for item in checks):
+            status = "warning"
+        return {
+            "ok": status != "error",
+            "status": status,
+            "cwd": str(cwd_path),
+            "projectId": project_id,
+            "workflowKind": _optional_string(args.get("workflow_kind")) or "plan",
+            "model": model,
+            "sandbox": sandbox,
+            "approvalPolicy": approval_policy,
+            "checks": checks,
+            "runtimeCapabilities": runtime_health_subset(runtime, capabilities.get("cacheState")),
+            "probeOperation": probe_operation,
+            "nextRecommendedAction": "start_workflow" if status == "ok" else "inspect_diagnostics",
+            "recommendedPollAfterSeconds": 0,
+            "pollRecommended": False,
+        }
+

@@ -4,6 +4,132 @@ from tests.helpers import *
 
 
 class McpDefinitionTests(unittest.TestCase):
+    def test_workflow_status_finds_and_adopts_later_transcript_plan_candidate(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project = root / "Book"
+            project.mkdir()
+            sessions = root / ".codex" / "sessions"
+            sessions.mkdir(parents=True)
+            thread_id = "thread-book"
+            official_turn_id = "turn-blocker"
+            candidate_turn_id = "turn-candidate"
+            transcript = sessions / "rollout-thread-book.jsonl"
+            rows = [
+                {"timestamp": "2026-06-18T21:15:00Z", "type": "session_meta", "payload": {"id": thread_id, "cwd": str(project)}},
+                {"timestamp": "2026-06-18T21:15:01Z", "type": "turn_context", "payload": {"turn_id": official_turn_id}},
+                {
+                    "timestamp": "2026-06-18T21:16:00Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": "Не могу подготовить план: CreateProcessAsUserW failed: 5",
+                    },
+                },
+                {"timestamp": "2026-06-18T21:16:10Z", "type": "event_msg", "payload": {"type": "task_complete", "turn_id": official_turn_id}},
+                {"timestamp": "2026-06-18T21:40:00Z", "type": "event_msg", "payload": {"type": "task_started", "turn_id": candidate_turn_id}},
+                {"timestamp": "2026-06-18T21:40:01Z", "type": "turn_context", "payload": {"turn_id": candidate_turn_id}},
+                {
+                    "timestamp": "2026-06-18T21:44:00Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": "<proposed_plan>\n# Plan\n\nWrite chapter one safely.\n</proposed_plan>",
+                    },
+                },
+                {"timestamp": "2026-06-18T21:44:10Z", "type": "event_msg", "payload": {"type": "task_complete", "turn_id": candidate_turn_id}},
+            ]
+            transcript.write_text("\n".join(json.dumps(row, ensure_ascii=False) for row in rows), encoding="utf-8")
+            state_db = root / ".codex" / "state_5.sqlite"
+            _create_threads_db(
+                state_db,
+                [
+                    {
+                        "id": thread_id,
+                        "rollout_path": str(transcript),
+                        "cwd": str(project),
+                        "title": "Book workflow",
+                        "preview": "",
+                        "created_at_ms": 1779667200000,
+                        "updated_at_ms": 1779669000000,
+                        "archived": 0,
+                    }
+                ],
+            )
+            service = ToolService(_search_service_config(root, state_db))
+            try:
+                now = "2026-06-18T21:16:10+00:00"
+                workflow_id = "wf-book"
+                service.storage.create_workflow(
+                    {
+                        "workflow_id": workflow_id,
+                        "client_request_id": "book:plan",
+                        "project_id": project_id_for_path(str(project)),
+                        "thread_id": thread_id,
+                        "plan_turn_id": official_turn_id,
+                        "execution_turn_id": None,
+                        "phase": "plan_ready",
+                        "status": "plan_ready",
+                        "created_at": now,
+                        "updated_at": now,
+                    }
+                )
+                service.storage.upsert_tracked_turn(
+                    {
+                        "turn_id": official_turn_id,
+                        "thread_id": thread_id,
+                        "chat_id": thread_id,
+                        "project_id": project_id_for_path(str(project)),
+                        "project_path": str(project),
+                        "status": "completed",
+                        "started_at": "2026-06-18T21:15:01+00:00",
+                        "updated_at": now,
+                        "completed_at": now,
+                        "first_message_at": now,
+                        "final_message": "Не могу подготовить план: CreateProcessAsUserW failed: 5",
+                        "last_assistant_message": "Не могу подготовить план: CreateProcessAsUserW failed: 5",
+                        "last_error": None,
+                        "source": "storage",
+                    }
+                )
+                service.storage.upsert_tracked_plan_item(
+                    {
+                        "item_id": f"{official_turn_id}:assistant-final-plan",
+                        "turn_id": official_turn_id,
+                        "thread_id": thread_id,
+                        "status": "completed",
+                        "text": "Не могу подготовить план: CreateProcessAsUserW failed: 5",
+                        "created_at": now,
+                        "updated_at": now,
+                        "completed_at": now,
+                        "sequence": 1,
+                        "payload_json": json.dumps({"source": "assistant_final_message_fallback"}),
+                    }
+                )
+
+                status = service.codex_get_workflow_status({"workflow_id": workflow_id})
+                observation = status["workflowObservation"]
+                self.assertEqual("plan_candidate_found", status["phase"])
+                self.assertEqual("adopt_candidate_plan", status["nextRecommendedAction"])
+                self.assertEqual("blocker", observation["officialPlanQuality"])
+                self.assertEqual(candidate_turn_id, observation["candidatePlans"][0]["turnId"])
+
+                adopted = service.codex_adopt_workflow_plan(
+                    {
+                        "workflow_id": workflow_id,
+                        "candidate_turn_id": candidate_turn_id,
+                        "candidate_plan_hash": observation["candidatePlans"][0]["planHash"],
+                    }
+                )
+            finally:
+                asyncio.run(service.close())
+
+        self.assertEqual("plan_ready", adopted["phase"])
+        self.assertEqual(candidate_turn_id, adopted["planTurnId"])
+        self.assertEqual("valid_plan", adopted["latestPlan"]["planQuality"])
+
     def test_plan_workflow_start_idempotency_ready_and_execute(self) -> None:
         async def scenario() -> tuple[dict, dict, dict, dict, dict, dict, dict, dict, list[dict]]:
             with TemporaryDirectory() as tmp:
@@ -175,9 +301,11 @@ class McpDefinitionTests(unittest.TestCase):
 
         ready = asyncio.run(scenario())
 
-        self.assertEqual("plan_ready", ready["phase"])
+        self.assertEqual("plan_needs_review", ready["phase"])
+        self.assertEqual("review_plan", ready["nextRecommendedAction"])
         self.assertEqual("Plain assistant plan fallback", ready["latestPlan"]["markdown"])
         self.assertEqual("completed", ready["latestPlan"]["status"])
+        self.assertIn(ready["latestPlan"]["planQuality"], {"partial", "needs_review"})
 
     def test_plan_workflow_goal_sets_once_and_clears_on_completion(self) -> None:
         async def scenario() -> tuple[dict, dict, dict, dict, int, int, int]:

@@ -46,6 +46,7 @@ from .hook_installer import hook_status as installed_hook_status
 from .logging_utils import get_logger
 from .models import Chat, TranscriptMessage, TranscriptSummary, TranscriptTurn
 from .pending_interactions import PendingInteractionManager, interaction_row_to_tool
+from .plan_quality import classify_plan_artifact, classify_plan_text, plan_candidate_payload, plan_hash_for_text, plan_quality_payload
 from .prompt_dedup import DEFAULT_PROMPT_SIMILARITY_THRESHOLD, normalize_prompt, prompt_hash, prompt_similarity
 from .protocol import with_output_schema
 from .runtime_capabilities import (
@@ -74,6 +75,7 @@ from .statuses import (
     TURN_TERMINAL_STATUSES,
 )
 from .storage import McpStorage
+from .transcript_importer import import_transcript_to_tracking
 from .transcripts import parse_transcript
 from .turn_tracker import WAITING_FOR_OPENCLAW_ERROR, progress_event_to_tool, turn_progress_status_fields
 
@@ -100,7 +102,9 @@ STABLE_OPENCLAW_TOOLS = {
     "codex_start_plan_workflow",
     "codex_start_review_workflow",
     "codex_get_workflow_status",
+    "codex_adopt_workflow_plan",
     "codex_approve_plan",
+    "codex_preflight_project_run",
     "codex_list_pending_interactions",
     "codex_answer_pending_interaction",
     "codex_interrupt_turn",
@@ -406,6 +410,23 @@ TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "codex_adopt_workflow_plan",
+        "description": "Adopt a newer valid Plan Mode candidate from the same Codex thread into an existing durable workflow. This is idempotent by workflow and plan hash and never starts execution by itself.",
+        "inputSchema": {
+            "type": "object",
+            "required": ["workflow_id", "candidate_turn_id", "candidate_plan_hash"],
+            "properties": {
+                "workflow_id": {"type": "string", "minLength": 1},
+                "candidate_turn_id": {"type": "string", "minLength": 1},
+                "candidate_plan_hash": {"type": "string", "minLength": 1},
+                "client_request_id": {"type": ["string", "null"], "default": None},
+                "adoption_note": {"type": ["string", "null"], "default": None, "maxLength": 4000},
+                "message_max_chars": {"type": "integer", "minimum": 500, "maximum": 200000, "default": 8000},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
         "name": "codex_approve_plan",
         "description": "Approve the latest completed Plan Mode plan for a durable workflow and queue the execution turn. Repeated calls are idempotent and do not create duplicate execution turns.",
         "inputSchema": {
@@ -437,6 +458,24 @@ TOOLS: list[dict[str, Any]] = [
                 },
                 "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 7200, "default": DEFAULT_TOOL_START_TIMEOUT_SECONDS},
                 "first_message_max_chars": {"type": "integer", "minimum": 500, "maximum": 200000, "default": 8000},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "codex_preflight_project_run",
+        "description": "Run read-only preflight checks before a long Codex workflow. Optionally starts a tiny live probe when live_probe=true.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": ["string", "null"], "default": None},
+                "cwd": {"type": ["string", "null"], "default": None},
+                "model": {"type": ["string", "null"], "default": None},
+                "sandbox": {"type": ["string", "null"], "enum": ["read-only", "workspace-write", "danger-full-access", None], "default": None},
+                "approval_policy": {"type": ["string", "null"], "enum": ["never", "on-request", "on-failure", "untrusted", "ask_openclaw", None], "default": None},
+                "workflow_kind": {"type": ["string", "null"], "enum": ["plan", "write", "review", None], "default": "plan"},
+                "live_probe": {"type": "boolean", "default": False},
+                "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 300, "default": 30},
             },
             "additionalProperties": False,
         },
@@ -847,6 +886,7 @@ TOOLS: list[dict[str, Any]] = [
                     "enum": [
                         "recover_stale_operations",
                         "refresh_catalog_and_history",
+                        "reconcile_workflow_from_thread",
                         "refresh_catalog_and_kb",
                         "mark_orphaned_after_exit",
                         "restart_app_server_idle",
@@ -977,8 +1017,16 @@ class ToolService:
                 result = await self.codex_get_workflow_status_async(args)
                 LOG.info("call done name=%s elapsed_ms=%d", name, int((time.monotonic() - started) * 1000))
                 return result
+            if name == "codex_adopt_workflow_plan":
+                result = self.codex_adopt_workflow_plan(args)
+                LOG.info("call done name=%s elapsed_ms=%d", name, int((time.monotonic() - started) * 1000))
+                return result
             if name == "codex_approve_plan":
                 result = self.codex_approve_plan(args)
+                LOG.info("call done name=%s elapsed_ms=%d", name, int((time.monotonic() - started) * 1000))
+                return result
+            if name == "codex_preflight_project_run":
+                result = await self.codex_preflight_project_run(args)
                 LOG.info("call done name=%s elapsed_ms=%d", name, int((time.monotonic() - started) * 1000))
                 return result
             if name == "codex_get_turn_status":
@@ -1721,6 +1769,7 @@ def _canonical_repair_action(action_name: str) -> str:
         "refresh_catalog": "refresh_catalog_and_history",
         "rebuild_search_index": "refresh_catalog_and_history",
         "refresh_catalog_and_kb": "refresh_catalog_and_history",
+        "workflow_thread_reconcile": "reconcile_workflow_from_thread",
     }
     return aliases.get(action_name, action_name)
 
@@ -2183,7 +2232,8 @@ def _pending_interaction_summary(row: dict[str, Any]) -> dict[str, Any]:
 
 
 def _plan_row_to_tool(row: dict[str, Any], max_chars: int) -> dict[str, Any]:
-    text, meta = _truncate_text(str(row.get("text") or ""), max_chars)
+    raw_text = str(row.get("text") or "")
+    text, meta = _truncate_text(raw_text, max_chars)
     return {
         "item_id": row.get("item_id"),
         "itemId": row.get("item_id"),
@@ -2202,6 +2252,8 @@ def _plan_row_to_tool(row: dict[str, Any], max_chars: int) -> dict[str, Any]:
         "completedAt": row.get("completed_at"),
         "truncated": bool(meta.get("truncated")),
         "originalChars": meta.get("original_chars"),
+        "planQuality": classify_plan_artifact(raw_text, row.get("payload_json")),
+        **plan_quality_payload(raw_text, row.get("payload_json")),
     }
 
 
@@ -2248,7 +2300,12 @@ def _derive_workflow_phase(
 
     plan_status = str((plan_turn or {}).get("status") or "unknown")
     if latest_plan is not None and latest_plan.get("status") == "completed":
-        return "plan_ready", "plan_ready", None
+        quality = str(latest_plan.get("planQuality") or latest_plan.get("quality") or classify_plan_text(latest_plan.get("markdown") or latest_plan.get("text")))
+        if quality == "valid_plan":
+            return "plan_ready", "plan_ready", None
+        if quality in {"blocker", "refusal"}:
+            return "failed", "failed", "Plan turn completed with a blocker/refusal instead of an executable plan."
+        return "plan_needs_review", "plan_needs_review", None
     if plan_status in {"failed", "aborted", "cancelled", "canceled", "interrupted"}:
         return "failed", plan_status, (plan_turn or {}).get("lastError") or workflow.get("last_error")
     if plan_status == "unknown_after_app_server_exit":
@@ -2315,6 +2372,10 @@ def _derive_review_workflow_phase(
 def _next_workflow_action(phase: str) -> str:
     if phase == "plan_ready":
         return "execute_plan"
+    if phase == "plan_needs_review":
+        return "review_plan"
+    if phase == "plan_candidate_found":
+        return "adopt_candidate_plan"
     if phase in {"waiting_for_approval", "waiting_for_user_input"}:
         return "answer_pending_interaction"
     if phase == "planning":
@@ -2345,7 +2406,7 @@ def _workflow_poll_seconds(phase: str) -> int:
         return 10
     if phase == "executing":
         return 30
-    if phase in {"plan_ready", "completed", "failed", "orphaned_after_app_server_exit"}:
+    if phase in {"plan_ready", "plan_needs_review", "plan_candidate_found", "completed", "failed", "orphaned_after_app_server_exit"}:
         return 0
     return 15
 

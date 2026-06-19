@@ -141,7 +141,9 @@ class McpDefinitionTests(unittest.TestCase):
                 "codex_start_plan_workflow",
                 "codex_start_review_workflow",
                 "codex_get_workflow_status",
+                "codex_adopt_workflow_plan",
                 "codex_approve_plan",
+                "codex_preflight_project_run",
                 "codex_get_turn_status",
                 "codex_execute_plan",
                 "codex_list_pending_interactions",
@@ -248,6 +250,10 @@ class McpDefinitionTests(unittest.TestCase):
         workflow_status_schema = by_name["codex_get_workflow_status"]["inputSchema"]
         self.assertEqual(["workflow_id"], workflow_status_schema["required"])
 
+        adopt_schema = by_name["codex_adopt_workflow_plan"]["inputSchema"]
+        self.assertEqual(["workflow_id", "candidate_turn_id", "candidate_plan_hash"], adopt_schema["required"])
+        self.assertIn("adoption_note", adopt_schema["properties"])
+
         approve_plan_schema = by_name["codex_approve_plan"]["inputSchema"]
         self.assertEqual(["workflow_id"], approve_plan_schema["required"])
         self.assertEqual("Implement the plan.", approve_plan_schema["properties"]["message"]["default"])
@@ -300,6 +306,10 @@ class McpDefinitionTests(unittest.TestCase):
         self.assertTrue(runtime_schema["include_skills"]["default"])
         self.assertTrue(runtime_schema["include_account"]["default"])
 
+        preflight_schema = by_name["codex_preflight_project_run"]["inputSchema"]["properties"]
+        self.assertFalse(preflight_schema["live_probe"]["default"])
+        self.assertIn("workflow_kind", preflight_schema)
+
         diagnostics_schema = by_name["codex_collect_diagnostics"]["inputSchema"]["properties"]
         self.assertIn("operation_id", diagnostics_schema)
         self.assertIn("include_logs", diagnostics_schema)
@@ -325,6 +335,7 @@ class McpDefinitionTests(unittest.TestCase):
         self.assertIn("mark_orphaned_after_exit", repair_schema["properties"]["action"]["enum"])
         self.assertIn("force_restart_app_server", repair_schema["properties"]["action"]["enum"])
         self.assertIn("cleanup_prompt_submissions", repair_schema["properties"]["action"]["enum"])
+        self.assertIn("reconcile_workflow_from_thread", repair_schema["properties"]["action"]["enum"])
         self.assertTrue(repair_schema["properties"]["dry_run"]["default"])
         self.assertEqual(30, repair_schema["properties"]["stale_after_minutes"]["default"])
         self.assertEqual(30, repair_schema["properties"]["older_than_days"]["default"])

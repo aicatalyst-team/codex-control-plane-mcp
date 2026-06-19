@@ -57,6 +57,7 @@ These tools are the supported surface for long-running Codex orchestration:
 - `codex_start_plan_workflow`
 - `codex_start_review_workflow`
 - `codex_get_workflow_status`
+- `codex_adopt_workflow_plan`
 - `codex_approve_plan`
 - `codex_list_pending_interactions`
 - `codex_answer_pending_interaction`
@@ -66,6 +67,7 @@ These tools are the supported surface for long-running Codex orchestration:
 - `codex_start_thread_compaction`
 - `codex_get_thread_compaction_status`
 - `codex_get_runtime_capabilities`
+- `codex_preflight_project_run`
 - `codex_health_summary`
 - `codex_collect_diagnostics`
 - `codex_repair_issue`
@@ -218,6 +220,69 @@ app-server exits before that event is observed, the action becomes
 
 Public `thread/delete` is intentionally not exposed in this contract. It is a
 destructive action and needs a separate confirmation and threat model.
+
+## Plan workflows and recovery
+
+`codex_start_plan_workflow` starts a durable Plan Mode workflow. Poll with
+`codex_get_workflow_status`. The normal path is:
+
+1. Start planning with `codex_start_plan_workflow`.
+2. Poll until the workflow asks for plan review.
+3. Approve with `codex_approve_plan` only after the plan is valid for the task.
+4. Poll the same workflow until the final report is ready.
+
+`latestPlan` includes quality fields:
+
+- `planQuality`: `valid_plan`, `blocker`, `question`, `partial`,
+  `needs_review`, or `unknown`.
+- `quality`: same value for compact clients.
+- `valid`: `true` only when MCP has a trusted usable plan artifact.
+
+`codex_approve_plan` rejects blocker, question, partial, and unknown plan
+artifacts. A fallback assistant message is not treated as a valid plan unless it
+contains an explicit plan artifact such as `<proposed_plan>...</proposed_plan>`.
+
+`codex_get_workflow_status` also returns `workflowObservation` for recovery:
+
+- `officialPlanTurnId`: turn currently attached to the workflow.
+- `officialPlanQuality`: quality classification for that official plan.
+- `latestThreadTurnId`: latest turn known in the workflow thread.
+- `threadAdvancedAfterOfficialTurn`: later turns exist in the same thread.
+- `recoverableCandidateFound`: a later valid plan/report candidate was found.
+- `candidatePlans`: candidate plans from the same thread with `turnId`,
+  `planHash`, `quality`, `planQuality`, and `markdown`.
+- `candidateReports`: future report candidates from the same observation pass.
+- `importStatus`: transcript import status, when MCP refreshed tracking from a
+  local transcript.
+
+When `nextRecommendedAction == "adopt_candidate_plan"`, the client should show
+the candidate to a human or policy engine, then call:
+
+```json
+{
+  "tool": "codex_adopt_workflow_plan",
+  "arguments": {
+    "workflow_id": "WORKFLOW_ID",
+    "candidate_turn_id": "CANDIDATE_TURN_ID",
+    "candidate_plan_hash": "CANDIDATE_PLAN_HASH",
+    "client_request_id": "CLIENT_RETRY_KEY"
+  }
+}
+```
+
+`codex_adopt_workflow_plan` updates the workflow's official plan turn and latest
+plan hash without starting execution. It is idempotent for the same workflow and
+candidate hash. After adoption, poll `codex_get_workflow_status` again and use
+the normal approve path.
+
+Diagnostics may report:
+
+- `workflow_thread_drift`: the thread has advanced after the official workflow
+  turn.
+- `workflow_recoverable_candidate_found`: a later valid candidate can be
+  adopted.
+- `invalid_plan_artifact`: the official plan is a blocker, question, partial
+  artifact, or otherwise unsafe to approve automatically.
 
 ## Code review workflows
 
@@ -519,6 +584,38 @@ model, sandbox readiness, provider capabilities, account authentication state,
 account and plan type, rate-limit reached state, credits availability, usage
 availability, and warning count. Health summary does not collect inventory on
 its own and does not include identity fields, balances, or exact usage values.
+
+## Project preflight
+
+`codex_preflight_project_run` is a read-only guard for long-running work. It is
+meant for clients that need a quick "can I start this run?" answer before
+submitting a plan workflow, review workflow, or durable operation.
+
+Inputs:
+
+- `project_id`: optional project id from `codex_list_projects`.
+- `cwd`: optional project root. If both `project_id` and `cwd` are present,
+  `cwd` must match the allowed project path.
+- `model`: optional model the client plans to use.
+- `sandbox`: optional sandbox mode the client plans to use.
+- `approval_policy`: optional approval policy the client plans to use.
+- `workflow_kind`: optional hint such as `plan_then_execute` or `code_review`.
+- `live_probe`: default `false`. When `true`, MCP starts a tiny safe Codex turn
+  with marker `MCP PREFLIGHT / DO NOT MODIFY FILES`.
+- `timeout_seconds`: short timeout for runtime inventory.
+
+Result fields:
+
+- `status`: `ready`, `degraded`, or `failed`.
+- `checks`: machine-readable checks for path, allowed roots, Codex home, auth,
+  hooks, runtime inventory, and optional live probe.
+- `runtimeCapabilities`: compact runtime subset.
+- `probeOperation`: durable operation ack when `live_probe=true`.
+- `nextRecommendedAction`: `start_run`, `inspect_warnings`, or `fix_environment`.
+- `pollRecommended=false`.
+
+Preflight does not replace `codex_get_runtime_capabilities`; it combines the
+parts OpenClaw needs before a concrete project run.
 
 ## Compatibility tools
 
