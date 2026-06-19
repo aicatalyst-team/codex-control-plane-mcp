@@ -373,12 +373,16 @@ class McpDefinitionTests(unittest.TestCase):
                     "message": "busy",
                     "details": {"thread_id": "thread-1"},
                     "retryable": True,
-                }
+                },
+                "agentGuidance": {"schemaVersion": "agent-guidance/v1", "problemState": "wait"},
+                "agentGuidanceText": "Poll the existing turn.",
             }
         )
         self.assertTrue(failure["isError"])
         self.assertFalse(failure["structuredContent"]["ok"])
         self.assertEqual("CODEX_BUSY", failure["structuredContent"]["error"]["code"])
+        self.assertEqual("agent-guidance/v1", failure["structuredContent"]["agentGuidance"]["schemaVersion"])
+        self.assertIn("Poll", failure["structuredContent"]["agentGuidanceText"])
 
     def test_stdio_tools_call_returns_structured_content(self) -> None:
         server = StdioMcpServer.__new__(StdioMcpServer)

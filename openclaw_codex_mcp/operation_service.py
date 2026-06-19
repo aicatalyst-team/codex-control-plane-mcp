@@ -1034,29 +1034,41 @@ class OperationServiceMixin:
         kb = self._kb_turn_status(turn_id, lookup_thread_id, last_messages=last_messages, message_max_chars=message_max_chars)
         if live is None:
             if hook is not None:
-                return self._attach_progress_status(hook, turn_id, progress_events=progress_events, progress_max_chars=progress_max_chars)
+                return self._attach_agent_guidance(
+                    self._attach_progress_status(hook, turn_id, progress_events=progress_events, progress_max_chars=progress_max_chars),
+                    surface="turn_status",
+                )
             if kb is None:
                 raise turn_not_found(turn_id)
-            return self._attach_progress_status(kb, turn_id, progress_events=progress_events, progress_max_chars=progress_max_chars)
+            return self._attach_agent_guidance(
+                self._attach_progress_status(kb, turn_id, progress_events=progress_events, progress_max_chars=progress_max_chars),
+                surface="turn_status",
+            )
         live_status = str(live.get("status") or "unknown")
         live_unknown = live_status in {"unknown", "unknown_after_app_server_exit"}
         live_active = live_status in TURN_ACTIVE_STATUSES or live_status in {"starting", "ready"}
         if hook is not None:
             if live_unknown and _turn_status_has_trusted_terminal_evidence(hook):
                 hook["source"] = "app_server+hook_history"
-                return self._attach_progress_status(hook, turn_id, progress_events=progress_events, progress_max_chars=progress_max_chars)
+                return self._attach_agent_guidance(
+                    self._attach_progress_status(hook, turn_id, progress_events=progress_events, progress_max_chars=progress_max_chars),
+                    surface="turn_status",
+                )
             if not live.get("last_messages") and hook.get("last_messages"):
                 live = _merge_turn_messages(live, hook, source="app_server+hook_history")
         if kb is not None:
             if live_unknown and _turn_status_has_trusted_terminal_evidence(kb):
                 kb["source"] = "app_server+kb_history"
-                return self._attach_progress_status(kb, turn_id, progress_events=progress_events, progress_max_chars=progress_max_chars)
+                return self._attach_agent_guidance(
+                    self._attach_progress_status(kb, turn_id, progress_events=progress_events, progress_max_chars=progress_max_chars),
+                    surface="turn_status",
+                )
             if not live.get("last_messages") and kb.get("last_messages"):
                 live = _merge_turn_messages(live, kb, source="app_server+kb_history")
         if live_active:
             live["completion_observed"] = False
             live["completionObserved"] = False
-        return live
+        return self._attach_agent_guidance(live, surface="turn_status")
 
     async def codex_execute_plan(self, args: dict[str, Any]) -> dict[str, Any]:
         workflow_id = _optional_string(args.get("workflow_id"))
@@ -1917,7 +1929,7 @@ class OperationServiceMixin:
                 event_to_tool(row, include_payload=False)
                 for row in self.storage.list_app_server_events(thread_id=thread_id, turn_id=turn_id, limit=50)
             ]
-        return response
+        return self._attach_agent_guidance(response, surface="operation_status")
 
     def _operation_final_report(
         self,

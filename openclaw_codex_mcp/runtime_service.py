@@ -10,6 +10,7 @@ class RuntimeServiceMixin:
         start_after_restart = bool(args.get("start_after_restart", True))
         timeout_seconds = _bounded_int(args.get("timeout_seconds", 30), 1, 120)
         force = bool(args.get("force", False))
+        from_repair = bool(args.get("_from_repair", False))
         if self._app_server is None:
             if not start_after_restart:
                 return {
@@ -22,7 +23,28 @@ class RuntimeServiceMixin:
                     "activeWork": {"pendingRequests": 0, "activeTurns": []},
                 }
             self._app_server = CodexAppServerClient(self.config, self.storage)
-        return await self._app_server.restart(start_after_restart=start_after_restart, timeout_seconds=timeout_seconds, force=force)
+        result = await self._app_server.restart(start_after_restart=start_after_restart, timeout_seconds=timeout_seconds, force=force)
+        if not from_repair:
+            action = "force_restart_app_server" if force else "restart_app_server_idle"
+            loop_guard = self._record_guidance_attempt(
+                action=action,
+                args=args,
+                result=result,
+                status="succeeded" if result.get("ok", True) else "failed",
+                count_attempt=True,
+                force=force,
+            )
+            result["loopGuard"] = loop_guard
+            post_guidance = build_post_repair_guidance(
+                {"changed": bool(result.get("restarted") or result.get("started")), **result},
+                action=action,
+                scope_type=loop_guard["scopeType"],
+                scope_id=loop_guard["scopeId"],
+                loop_guard=loop_guard,
+            )
+            result["postRepairGuidance"] = post_guidance
+            result["postRepairGuidanceText"] = guidance_text(post_guidance)
+        return result
 
     def codex_get_app_server_status(self, args: dict[str, Any]) -> dict[str, Any]:
         include_recent_events = bool(args.get("include_recent_events", False))
@@ -405,7 +427,7 @@ class RuntimeServiceMixin:
             status = "error"
         elif any(item["status"] == "warning" for item in checks):
             status = "warning"
-        return {
+        result = {
             "ok": status != "error",
             "status": status,
             "cwd": str(cwd_path),
@@ -421,4 +443,5 @@ class RuntimeServiceMixin:
             "recommendedPollAfterSeconds": 0,
             "pollRecommended": False,
         }
+        return self._attach_agent_guidance(result, surface="preflight_project_run")
 

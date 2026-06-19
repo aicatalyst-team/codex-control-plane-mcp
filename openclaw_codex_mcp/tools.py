@@ -15,6 +15,16 @@ from typing import Any
 from urllib.parse import urlparse
 
 from . import __version__
+from .agent_guidance import (
+    attempt_scope_from_args,
+    build_guidance_for_error,
+    build_guidance_for_payload,
+    build_post_repair_guidance,
+    cooldown_after_attempt,
+    guard_key_for,
+    guidance_text,
+    loop_guard_state,
+)
 from .catalog import ProjectChatCatalog, project_id_for_path
 from .chat_summarizer import ChatHistorySplit, filter_meaningful_messages_for_summary, summarize_chat_history, split_before_latest_user
 from .codex_app_server import CodexAppServerClient
@@ -972,6 +982,81 @@ class ToolService:
             await self._app_server.stop()
         self.storage.close()
 
+    def _attach_agent_guidance(self, payload: dict[str, Any], *, surface: str) -> dict[str, Any]:
+        guidance = build_guidance_for_payload(
+            payload,
+            surface=surface,
+            attempt_lookup=self.storage.get_agent_guidance_attempt,
+        )
+        if guidance is None:
+            return payload
+        payload["agentGuidance"] = guidance
+        payload["agentGuidanceText"] = guidance_text(guidance)
+        payload["recoveryAttemptState"] = guidance.get("loopGuard")
+        return payload
+
+    def _attach_error_guidance(self, payload: dict[str, Any], *, tool_name: str) -> dict[str, Any]:
+        error = payload.get("error") if isinstance(payload.get("error"), dict) else None
+        if error is None:
+            return payload
+        guidance = build_guidance_for_error(
+            error,
+            tool_name=tool_name,
+            attempt_lookup=self.storage.get_agent_guidance_attempt,
+        )
+        if guidance is None:
+            return payload
+        payload["agentGuidance"] = guidance
+        payload["agentGuidanceText"] = guidance_text(guidance)
+        payload["recoveryAttemptState"] = guidance.get("loopGuard")
+        return payload
+
+    def _record_guidance_attempt(
+        self,
+        *,
+        action: str,
+        args: dict[str, Any],
+        result: dict[str, Any],
+        status: str,
+        count_attempt: bool,
+        force: bool = False,
+    ) -> dict[str, Any]:
+        scope_type, scope_id = attempt_scope_from_args(action, args)
+        guard_key = guard_key_for(
+            category=f"action:{action}",
+            scope_type=scope_type,
+            scope_id=scope_id,
+            action=action,
+            target={},
+        )
+        now = _now_iso()
+        current = self.storage.get_agent_guidance_attempt(guard_key)
+        next_attempt_count = int((current or {}).get("attempt_count") or 0) + (1 if count_attempt else 0)
+        cooldown_until = (
+            cooldown_after_attempt(action, next_attempt_count, now=now, failed_forced=force and status == "failed")
+            if count_attempt
+            else (current or {}).get("cooldown_until")
+        )
+        row = self.storage.record_agent_guidance_attempt(
+            guard_key=guard_key,
+            scope_type=scope_type,
+            scope_id=scope_id,
+            action=action,
+            status=status,
+            created_at=now,
+            cooldown_until=cooldown_until,
+            result=redact_payload(result),
+            count_attempt=count_attempt,
+        )
+        return loop_guard_state(
+            guard_key=guard_key,
+            scope_type=scope_type,
+            scope_id=scope_id,
+            action=action,
+            attempt_row=row,
+            now=now,
+        )
+
     async def call(self, name: str, arguments: dict[str, Any] | None) -> dict[str, Any]:
         args = arguments or {}
         started = time.monotonic()
@@ -1113,13 +1198,13 @@ class ToolService:
             raise invalid_argument(f"Unknown tool: {name}")
         except CodexMcpError as exc:
             LOG.warning("call codex error name=%s code=%s retryable=%s", name, exc.code, exc.retryable)
-            return exc.to_dict()
+            return self._attach_error_guidance(exc.to_dict(), tool_name=name)
         except RuntimeError as exc:
             LOG.exception("call runtime error name=%s", name)
-            return send_failed(str(exc)).to_dict()
+            return self._attach_error_guidance(send_failed(str(exc)).to_dict(), tool_name=name)
         except Exception as exc:
             LOG.exception("call unexpected error name=%s", name)
-            return send_failed(str(exc)).to_dict()
+            return self._attach_error_guidance(send_failed(str(exc)).to_dict(), tool_name=name)
 
     async def _app(self) -> CodexAppServerClient:
         if self._app_server is None:

@@ -19,6 +19,9 @@ GENERIC_OUTPUT_SCHEMA: dict[str, Any] = {
             },
             "additionalProperties": True,
         },
+        "agentGuidance": {"type": "object", "additionalProperties": True},
+        "agentGuidanceText": {"type": "string"},
+        "recoveryAttemptState": {"type": "object", "additionalProperties": True},
     },
     "additionalProperties": True,
 }
@@ -32,7 +35,7 @@ def with_output_schema(tool: dict[str, Any]) -> dict[str, Any]:
 def normalize_tool_payload(result: Any) -> dict[str, Any]:
     if isinstance(result, dict) and isinstance(result.get("error"), dict):
         error = dict(result["error"])
-        return {
+        structured = {
             "ok": False,
             "error": {
                 "code": str(error.get("code") or "ERROR"),
@@ -41,6 +44,10 @@ def normalize_tool_payload(result: Any) -> dict[str, Any]:
                 "retryable": bool(error.get("retryable", False)),
             },
         }
+        for key, value in result.items():
+            if key != "error":
+                structured[key] = value
+        return structured
 
     if isinstance(result, dict):
         payload = dict(result)

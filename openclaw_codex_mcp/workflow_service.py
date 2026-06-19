@@ -910,7 +910,7 @@ class WorkflowServiceMixin:
         result.update(runtime_policy_fields)
         if include_events:
             result["events"] = [_workflow_event_to_tool(row) for row in self.storage.list_workflow_events(workflow_id, limit=20)]
-        return result
+        return self._attach_agent_guidance(result, surface="workflow_status")
 
     def _refresh_workflow_thread_tracking(self, workflow: dict[str, Any], *, thread_id: str | None) -> dict[str, Any]:
         if not thread_id:

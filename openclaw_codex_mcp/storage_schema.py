@@ -162,6 +162,28 @@ class StorageSchemaMixin:
             ON codex_thread_lifecycle_actions(status, updated_at)
             """
         )
+        self.connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS agent_guidance_attempts(
+              guard_key TEXT PRIMARY KEY,
+              scope_type TEXT NOT NULL,
+              scope_id TEXT NOT NULL,
+              action TEXT NOT NULL,
+              status TEXT NOT NULL,
+              attempt_count INTEGER NOT NULL DEFAULT 0,
+              first_seen_at TEXT NOT NULL,
+              last_attempt_at TEXT,
+              cooldown_until TEXT,
+              last_result_json TEXT
+            )
+            """
+        )
+        self.connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_agent_guidance_attempts_scope
+            ON agent_guidance_attempts(scope_type, scope_id, action)
+            """
+        )
 
     def _add_column_if_missing(self, table: str, column: str, declaration: str) -> None:
         columns = {

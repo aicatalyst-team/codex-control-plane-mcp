@@ -966,6 +966,37 @@ operations.
 - `recommendedActions`;
 - `repairActions`.
 
+### Agent guidance
+
+Если status, diagnostics, preflight или structured error вернули
+`agentGuidance`, считай этот блок главным контрактом для следующего шага.
+
+Сначала читай:
+
+- `problemState`;
+- `summary`;
+- `instructions`;
+- `loopGuard`;
+- `evidenceRefs`;
+- `agentGuidanceText`.
+
+Правила для OpenClaw:
+
+1. Выполняй `agentGuidance.instructions` перед тем, как переводить run в blocked.
+2. Если instruction содержит `dryRunFirst=true`, сначала вызови repair с
+   `dry_run=true`.
+3. Если `loopGuard.allowed=false`, останови автоматический recovery для этого
+   scope. Собери diagnostics и попроси человека.
+4. После `CODEX_TIMEOUT` poll-ь существующую operation или повторяй запрос с
+   тем же `client_request_id`. Новый id не создавай.
+5. Pending approvals и user input нужно ответить или истечь. Не перезапускай
+   turn, чтобы обойти ожидание.
+6. Auth и rate limit guidance означает ждать или просить человека. Повторный
+   запуск turns здесь только тратит время.
+
+`agentGuidanceText` подходит для логов и сообщений оператору. Решения принимай
+по `agentGuidance.instructions`.
+
 По умолчанию не запрашивай raw payload. Если нужен `include_payload=true`, не
 показывай результат пользователю без redaction.
 

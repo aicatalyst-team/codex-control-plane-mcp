@@ -651,6 +651,60 @@ Result fields:
 Preflight does not replace `codex_get_runtime_capabilities`; it combines the
 parts OpenClaw needs before a concrete project run.
 
+## Agent guidance
+
+Status, diagnostics, preflight, repair, and selected structured error responses
+may include these additive fields:
+
+- `agentGuidance`
+- `agentGuidanceText`
+- `recoveryAttemptState`
+
+`agentGuidance.schemaVersion` is `agent-guidance/v1`.
+
+`agentGuidance.problemState` is one of:
+
+- `wait`
+- `recoverable`
+- `needs_input`
+- `blocked`
+- `fatal`
+- `no_action`
+
+`agentGuidance.instructions` is the preferred automation contract for
+OpenClaw/Hermes. Each instruction includes a `kind`, optional `toolName`,
+redacted `arguments`, `reason`, `expectedOutcome`, `risk`, `dryRunFirst`,
+`requiresHuman`, `stopIf`, and `continueIf`.
+
+`agentGuidance.loopGuard` prevents recovery loops. The guard key is stable for
+the same problem scope and action. Default limits:
+
+- same repair action on the same scope: two attempts per two hours;
+- app-server restart on the same scope: two attempts per 30 minutes;
+- workflow runtime retry from the same workflow: two retries per 24 hours;
+- forced or destructive actions: one failed forced attempt blocks further
+  automatic recovery.
+
+When `loopGuard.allowed=false`, the client must stop automatic recovery for that
+scope, collect diagnostics, and ask a human. Status and diagnostic methods never
+execute repair by themselves. `codex_repair_issue(dry_run=false)`,
+`codex_restart_app_server`, and `codex_interrupt_turn` record guarded attempts.
+Dry runs are recorded for audit but do not consume the retry budget.
+
+Known guidance rules:
+
+- active duplicate prompt: poll the existing operation;
+- `CODEX_TIMEOUT` with a `client_request_id`: poll first, then retry only with
+  the same id if needed;
+- failed Plan Mode with sandbox evidence: run
+  `retry_workflow_with_runtime_policy` as dry run first;
+- app-server unavailable while turns are active: collect diagnostics before
+  restart;
+- pending interaction: answer or expire it, do not restart the turn;
+- auth or rate limit problem: wait or ask a human;
+- invalid argument, missing project, missing thread, or missing turn: fix the
+  payload or configuration before retrying.
+
 ## Compatibility tools
 
 These tools remain available for UI support, direct reads, diagnostics, and old

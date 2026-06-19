@@ -429,3 +429,123 @@ class DiagnosticStoreMixin:
             ),
         )
         self.connection.commit()
+
+    def get_agent_guidance_attempt(self, guard_key: str) -> dict[str, Any] | None:
+        row = self.connection.execute(
+            """
+            SELECT *
+            FROM agent_guidance_attempts
+            WHERE guard_key = ?
+            LIMIT 1
+            """,
+            (guard_key,),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def list_agent_guidance_attempts(
+        self,
+        *,
+        scope_type: str | None = None,
+        scope_id: str | None = None,
+        action: str | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if scope_type:
+            clauses.append("scope_type = ?")
+            params.append(scope_type)
+        if scope_id:
+            clauses.append("scope_id = ?")
+            params.append(scope_id)
+        if action:
+            clauses.append("action = ?")
+            params.append(action)
+        where = "WHERE " + " AND ".join(clauses) if clauses else ""
+        rows = self.connection.execute(
+            f"""
+            SELECT *
+            FROM agent_guidance_attempts
+            {where}
+            ORDER BY COALESCE(last_attempt_at, first_seen_at) DESC
+            LIMIT ?
+            """,
+            (*params, limit),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def record_agent_guidance_attempt(
+        self,
+        *,
+        guard_key: str,
+        scope_type: str,
+        scope_id: str,
+        action: str,
+        status: str,
+        created_at: str,
+        cooldown_until: str | None,
+        result: dict[str, Any] | None,
+        count_attempt: bool = True,
+    ) -> dict[str, Any]:
+        existing = self.get_agent_guidance_attempt(guard_key)
+        if existing is None:
+            self.connection.execute(
+                """
+                INSERT INTO agent_guidance_attempts(
+                  guard_key, scope_type, scope_id, action, status, attempt_count,
+                  first_seen_at, last_attempt_at, cooldown_until, last_result_json
+                )
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    guard_key,
+                    scope_type,
+                    scope_id,
+                    action,
+                    status,
+                    1 if count_attempt else 0,
+                    created_at,
+                    created_at if count_attempt else None,
+                    cooldown_until,
+                    json.dumps(result or {}, ensure_ascii=False),
+                ),
+            )
+        else:
+            self.connection.execute(
+                """
+                UPDATE agent_guidance_attempts SET
+                  scope_type = ?,
+                  scope_id = ?,
+                  action = ?,
+                  status = ?,
+                  attempt_count = attempt_count + ?,
+                  last_attempt_at = COALESCE(?, last_attempt_at),
+                  cooldown_until = ?,
+                  last_result_json = ?
+                WHERE guard_key = ?
+                """,
+                (
+                    scope_type,
+                    scope_id,
+                    action,
+                    status,
+                    1 if count_attempt else 0,
+                    created_at if count_attempt else None,
+                    cooldown_until,
+                    json.dumps(result or {}, ensure_ascii=False),
+                    guard_key,
+                ),
+            )
+        self.connection.commit()
+        return self.get_agent_guidance_attempt(guard_key) or {
+            "guard_key": guard_key,
+            "scope_type": scope_type,
+            "scope_id": scope_id,
+            "action": action,
+            "status": status,
+            "attempt_count": 1 if count_attempt else 0,
+            "first_seen_at": created_at,
+            "last_attempt_at": created_at if count_attempt else None,
+            "cooldown_until": cooldown_until,
+            "last_result_json": json.dumps(result or {}, ensure_ascii=False),
+        }

@@ -396,6 +396,22 @@ CREATE TABLE IF NOT EXISTS repair_runs(
   created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS agent_guidance_attempts(
+  guard_key TEXT PRIMARY KEY,
+  scope_type TEXT NOT NULL,
+  scope_id TEXT NOT NULL,
+  action TEXT NOT NULL,
+  status TEXT NOT NULL,
+  attempt_count INTEGER NOT NULL DEFAULT 0,
+  first_seen_at TEXT NOT NULL,
+  last_attempt_at TEXT,
+  cooldown_until TEXT,
+  last_result_json TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_guidance_attempts_scope
+ON agent_guidance_attempts(scope_type, scope_id, action);
+
 CREATE TABLE IF NOT EXISTS pending_interactions(
   interaction_id TEXT PRIMARY KEY,
   app_server_request_id TEXT NOT NULL,

@@ -931,6 +931,37 @@ Read:
 - `recommendedActions`;
 - `repairActions`.
 
+### Agent guidance
+
+When a status, diagnostic, preflight, or structured error response contains
+`agentGuidance`, treat it as the next automation contract.
+
+Read these fields first:
+
+- `problemState`;
+- `summary`;
+- `instructions`;
+- `loopGuard`;
+- `evidenceRefs`;
+- `agentGuidanceText`.
+
+Rules for OpenClaw:
+
+1. Follow `agentGuidance.instructions` before marking a run blocked.
+2. If an instruction says `dryRunFirst=true`, call the suggested repair with
+   `dry_run=true` before making changes.
+3. If `loopGuard.allowed=false`, stop automatic recovery for that scope. Collect
+   diagnostics and ask a human.
+4. After `CODEX_TIMEOUT`, poll the existing operation or retry with the same
+   `client_request_id`. Do not mint a new id.
+5. Pending approvals or user input must be answered or expired. Do not restart
+   the turn to get around them.
+6. Auth and rate-limit guidance means wait or ask a human. Retrying turns will
+   waste time.
+
+`agentGuidanceText` is for logs and operator messages. Use
+`agentGuidance.instructions` for decisions.
+
 Do not request raw payloads by default. If `include_payload=true` is needed, do
 not show the result to a user without redaction.
 

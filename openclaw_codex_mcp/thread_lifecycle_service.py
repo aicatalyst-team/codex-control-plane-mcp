@@ -96,6 +96,7 @@ class ThreadLifecycleServiceMixin:
         thread_id = target["threadId"]
         turn_id = target["turnId"]
         timeout_seconds = _bounded_int(args.get("timeout_seconds", 30), 1, 120)
+        from_repair = bool(args.get("_from_repair", False))
         client = await self._app()
         result = await client.turn_interrupt(thread_id=thread_id, turn_id=turn_id, timeout_seconds=timeout_seconds)
         status = client.tracker.get_turn_status(turn_id, last_messages=10, message_max_chars=8000)
@@ -124,7 +125,7 @@ class ThreadLifecycleServiceMixin:
                     updated_at=now,
                     completed_at=now,
                 )
-        return {
+        response = {
             "ok": True,
             "interrupted": True,
             "thread_id": thread_id,
@@ -141,6 +142,26 @@ class ThreadLifecycleServiceMixin:
             "appServerResult": result,
             "turnStatus": status,
         }
+        if not from_repair:
+            loop_guard = self._record_guidance_attempt(
+                action="interrupt_turn",
+                args={**args, "thread_id": thread_id, "turn_id": turn_id},
+                result=response,
+                status="succeeded",
+                count_attempt=True,
+                force=True,
+            )
+            response["loopGuard"] = loop_guard
+            post_guidance = build_post_repair_guidance(
+                {"changed": True, **response},
+                action="interrupt_turn",
+                scope_type=loop_guard["scopeType"],
+                scope_id=loop_guard["scopeId"],
+                loop_guard=loop_guard,
+            )
+            response["postRepairGuidance"] = post_guidance
+            response["postRepairGuidanceText"] = guidance_text(post_guidance)
+        return response
 
     def _resolve_interrupt_target(self, args: dict[str, Any]) -> dict[str, Any]:
         thread_id = _optional_string(args.get("thread_id"))

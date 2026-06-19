@@ -125,7 +125,7 @@ class DiagnosticServiceMixin:
             "recommendedPollAfterSeconds": 15 if active_turns or pending or stale_operations else 0,
             "pollRecommended": bool(active_turns or pending or stale_operations),
         }
-        return redact_payload(result)
+        return redact_payload(self._attach_agent_guidance(result, surface="health_summary"))
 
     def _diagnostic_context(self, args: dict[str, Any]) -> dict[str, Any]:
         operation_id = _optional_string(args.get("operation_id"))
@@ -320,7 +320,7 @@ class DiagnosticServiceMixin:
                     "include_payload": False,
                 }
             )
-        return redact_payload(result)
+        return redact_payload(self._attach_agent_guidance(result, surface="collect_diagnostics"))
 
     def codex_get_diagnostic_logs(self, args: dict[str, Any]) -> dict[str, Any]:
         source = str(args.get("source") or "all")
@@ -422,12 +422,13 @@ class DiagnosticServiceMixin:
                 recommended_actions=item.get("recommendedActions") if isinstance(item.get("recommendedActions"), list) else [],
                 created_at=created_at,
             )
-        return {
+        result = {
             "ok": True,
             "diagnosisId": diagnosis_id,
             "createdAt": created_at,
             **analysis,
         }
+        return self._attach_agent_guidance(result, surface="analyze_issue")
 
     async def codex_repair_issue(self, args: dict[str, Any]) -> dict[str, Any]:
         requested_action = _required_string(args, "action")
@@ -473,12 +474,12 @@ class DiagnosticServiceMixin:
             repair_result = {"wouldRun": True, "action": action_name, "message": "Dry run only; no repair action was executed."}
         elif action_name == "restart_app_server_idle":
             repair_result = await self.codex_restart_app_server(
-                {"start_after_restart": True, "timeout_seconds": _bounded_int(args.get("timeout_seconds", 30), 1, 120), "force": False}
+                {"start_after_restart": True, "timeout_seconds": _bounded_int(args.get("timeout_seconds", 30), 1, 120), "force": False, "_from_repair": True}
             )
             changed = bool(repair_result.get("restarted") or repair_result.get("started"))
         elif action_name == "force_restart_app_server":
             repair_result = await self.codex_restart_app_server(
-                {"start_after_restart": True, "timeout_seconds": _bounded_int(args.get("timeout_seconds", 30), 1, 120), "force": True}
+                {"start_after_restart": True, "timeout_seconds": _bounded_int(args.get("timeout_seconds", 30), 1, 120), "force": True, "_from_repair": True}
             )
             changed = bool(repair_result.get("restarted") or repair_result.get("started"))
         elif action_name == "mark_stale_turns_orphaned":
@@ -514,6 +515,7 @@ class DiagnosticServiceMixin:
                     "operation_id": args.get("operation_id"),
                     "workflow_id": args.get("workflow_id"),
                     "timeout_seconds": _bounded_int(args.get("timeout_seconds", 30), 1, 120),
+                    "_from_repair": True,
                 }
             )
             changed = bool(repair_result.get("interrupted"))
@@ -542,7 +544,24 @@ class DiagnosticServiceMixin:
             result=repair_result,
             created_at=created_at,
         )
-        return {
+        attempt_status = "dry_run" if dry_run else ("succeeded" if changed else "completed_no_change")
+        loop_guard = self._record_guidance_attempt(
+            action=action_name,
+            args=args,
+            result=repair_result,
+            status=attempt_status,
+            count_attempt=not dry_run,
+            force=force,
+        )
+        scope_type, scope_id = attempt_scope_from_args(action_name, args)
+        post_repair_guidance = build_post_repair_guidance(
+            {"changed": changed, **(repair_result if isinstance(repair_result, dict) else {})},
+            action=action_name,
+            scope_type=scope_type,
+            scope_id=scope_id,
+            loop_guard=loop_guard,
+        )
+        result = {
             "ok": True,
             "repairRunId": repair_run_id,
             "action": action_name,
@@ -554,7 +573,11 @@ class DiagnosticServiceMixin:
             "after": after,
             "result": redact_payload(repair_result),
             "remainingIssues": after.get("checks", []),
+            "loopGuard": loop_guard,
+            "postRepairGuidance": post_repair_guidance,
+            "postRepairGuidanceText": guidance_text(post_repair_guidance),
         }
+        return result
 
     def _pending_interactions_for_diagnostics(self, context: dict[str, Any], *, limit: int) -> list[dict[str, Any]]:
         thread_id = context.get("threadId")

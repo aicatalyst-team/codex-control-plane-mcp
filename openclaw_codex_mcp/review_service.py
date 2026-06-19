@@ -630,7 +630,7 @@ class ReviewServiceMixin:
         }
         if include_events:
             result["events"] = [_workflow_event_to_tool(row) for row in self.storage.list_workflow_events(workflow_id, limit=20)]
-        return result
+        return self._attach_agent_guidance(result, surface="workflow_status")
 
     def _review_workflow_final_report(
         self,

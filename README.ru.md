@@ -389,6 +389,15 @@ codex_repair_issue
 
 Repair actions по умолчанию идут с `dry_run=true`.
 
+Status и diagnostic tools также возвращают `agentGuidance` и
+`agentGuidanceText`, если MCP видит blocker, failed state, stale run, pending
+interaction, duplicate prompt, проблему auth, rate limit или опасный recovery
+loop. Агент должен сначала выполнить `agentGuidance.instructions`, а уже потом
+решать, retry это или остановка. Если `agentGuidance.loopGuard.allowed=false`,
+автоматический recovery нужно остановить, собрать diagnostics и попросить
+человека. После timeout нельзя придумывать новый `client_request_id`, если
+guidance явно не говорит стартовать replacement workflow.
+
 Для сломанного Plan Mode workflow используйте
 `retry_workflow_with_runtime_policy`. Action создает новый workflow с выбранными
 sandbox и approval policy, связывает его со старым через `workflowRetryState` и
