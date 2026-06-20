@@ -2,10 +2,13 @@ FROM registry.access.redhat.com/ubi9/python-312
 
 WORKDIR /opt/app-root/src
 
-# Copy project files
-COPY pyproject.toml MANIFEST.in ./
+# Copy all project files needed for installation
+COPY pyproject.toml MANIFEST.in README.md LICENSE ./
 COPY codex_control_plane_mcp/ codex_control_plane_mcp/
 COPY openclaw_codex_mcp/ openclaw_codex_mcp/
+COPY server.json ./
+COPY examples/ examples/
+COPY scripts/ scripts/
 
 # Install the package (zero external dependencies)
 RUN pip install --no-cache-dir .
