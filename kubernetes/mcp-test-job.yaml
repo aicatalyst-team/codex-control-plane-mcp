@@ -1,0 +1,57 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: codex-cpmcp-mcp-test
+  namespace: poc-codex-control-plane-mcp
+  labels:
+    app: codex-control-plane-mcp
+    autopoc.io/project: codex-control-plane-mcp
+spec:
+  backoffLimit: 1
+  activeDeadlineSeconds: 120
+  template:
+    metadata:
+      labels:
+        app: codex-control-plane-mcp
+    spec:
+      containers:
+        - name: mcp-test
+          image: quay.io/aicatalyst/codex-control-plane-mcp:latest
+          imagePullPolicy: Always
+          command:
+            - /bin/bash
+            - -c
+            - |
+              echo '=== MCP Protocol Test ==='
+              
+              # Test 1: Initialize handshake
+              echo '--- Test 1: Initialize ---'
+              INIT_MSG='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"autopoc-test","version":"1.0"}}}'
+              RESPONSE=$(echo "$INIT_MSG" | timeout 15 codex-control-plane-mcp 2>/dev/null || true)
+              echo "Response: $RESPONSE"
+              
+              # Test 2: Tools list
+              echo '--- Test 2: Tools List ---'
+              TOOLS_MSG='{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
+              MSGS=$(printf '%s\n%s\n' "$INIT_MSG" "$TOOLS_MSG")
+              RESPONSE=$(echo "$MSGS" | timeout 15 codex-control-plane-mcp 2>/dev/null || true)
+              echo "Response: $RESPONSE"
+              
+              # Test 3: Import check (verify Python package is importable)
+              echo '--- Test 3: Import Check ---'
+              python3 -c "from openclaw_codex_mcp import __version__; print(f'Version: {__version__}')" 2>&1
+              
+              echo '=== Tests Complete ==='
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "250m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+      restartPolicy: Never

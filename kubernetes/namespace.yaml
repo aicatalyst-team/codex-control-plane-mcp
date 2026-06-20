@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: poc-codex-control-plane-mcp
+  labels:
+    app.kubernetes.io/name: codex-control-plane-mcp
+    app.kubernetes.io/managed-by: autopoc
