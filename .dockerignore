@@ -1,0 +1,16 @@
+.git
+*.md
+LICENSE
+kubernetes/
+poc-plan.md
+tests/
+docs/
+__pycache__/
+.env*
+*.pyc
+.github/
+assets/
+examples/
+scripts/
+*.cmd
+*.ps1

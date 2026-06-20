@@ -1,0 +1,21 @@
+FROM registry.access.redhat.com/ubi9/python-312
+
+WORKDIR /opt/app-root/src
+
+# Copy project files
+COPY pyproject.toml MANIFEST.in ./
+COPY codex_control_plane_mcp/ codex_control_plane_mcp/
+COPY openclaw_codex_mcp/ openclaw_codex_mcp/
+
+# Install the package (zero external dependencies)
+RUN pip install --no-cache-dir .
+
+# OpenShift compatibility
+RUN chgrp -R 0 /opt/app-root && chmod -R g=u /opt/app-root
+
+# No EXPOSE - stdio transport, no HTTP port
+
+USER 1001
+
+# The MCP server reads JSON-RPC from stdin and writes to stdout
+ENTRYPOINT ["codex-control-plane-mcp"]
