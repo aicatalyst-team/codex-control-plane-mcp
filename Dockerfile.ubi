@@ -13,12 +13,12 @@ COPY scripts/ scripts/
 # Install the package (zero external dependencies)
 RUN pip install --no-cache-dir .
 
-# OpenShift compatibility
+# OpenShift compatibility - must run as root for chgrp
+USER 0
 RUN chgrp -R 0 /opt/app-root && chmod -R g=u /opt/app-root
+USER 1001
 
 # No EXPOSE - stdio transport, no HTTP port
-
-USER 1001
 
 # The MCP server reads JSON-RPC from stdin and writes to stdout
 ENTRYPOINT ["codex-control-plane-mcp"]
